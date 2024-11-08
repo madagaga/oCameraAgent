@@ -226,17 +226,6 @@ func (this *Demuxer) handleNALU(naluType byte, payload []byte, ts uint32) ([]byt
 
 
 
-func (this *Demuxer) decodePCMA(audioPayload []byte) []byte {
-    pcmData := make([]byte, len(audioPayload)*2) // Each sample will be 2 bytes (16 bits)
-    for i, alawByte := range audioPayload {
-        sample := alawToLinear(alawByte)
-        pcmData[i*2] = byte(sample & 0xFF)
-        pcmData[i*2+1] = byte((sample >> 8) & 0xFF)
-    }
-    return pcmData
-}
-
-
 func (this *Demuxer) splitNALUs(b []byte) (nalus [][]byte, typ int) {
 	// Check if there's enough data to do anything meaningful
 	if len(b) < 4 {
