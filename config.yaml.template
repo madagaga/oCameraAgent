@@ -1,0 +1,9 @@
+mqtt:
+  url: "ssl://broker:port"  
+  username: "username"
+  password: "password"
+  name: "Camera 1"
+
+device:
+  url: "rtsp://ip:port/stream"
+  id: "uniqueid"
