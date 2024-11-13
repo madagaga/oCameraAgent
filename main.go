@@ -6,12 +6,15 @@ import (
     "os/signal"
     "syscall"
     "github.com/pion/webrtc/v4"
+    "flag"
 )
 
 func main() {
     
-    configFile := "config.yaml"
-    config, err := loadConfig(configFile)
+
+    configFile := flag.String("config","config.yaml", "config file path")
+    flag.Parse()
+    config, err := loadConfig(*configFile)
     if err != nil {
         log.Fatalf("Error while loading config: %v", err)
     }
