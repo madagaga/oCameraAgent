@@ -50,6 +50,7 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
       with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
         release_id: ${{ steps.create_release.outputs.id }}
         asset_path: ./oCameraAgent
         asset_name: oCameraAgent
@@ -60,6 +61,7 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
       with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
         release_id: ${{ steps.create_release.outputs.id }}
         asset_path: ./oCameraAgent.arm
         asset_name: oCameraAgent.arm
