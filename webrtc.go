@@ -198,10 +198,11 @@ func (this *WebRTCProxy) sendPacket(payload []byte, timestamp uint32, isVideo bo
 
 func (this *WebRTCProxy) StartRTSPStream() {
 	log.Printf("[RTSP] - Connecting to RTSP %s...", this.rtspUrl)
-	this.rtspClient = NewRtspClient()
+    
+    this.rtspClient = NewRtspClient()
 	this.demuxer.reset()
 
-	if status, message := this.rtspClient.Client(this.rtspUrl, false); status {
+	if err := this.rtspClient.Client(this.rtspUrl, false); err == nil {
 		log.Println("[RTSP] - Connected")
 		for {
 			select {
@@ -224,7 +225,7 @@ func (this *WebRTCProxy) StartRTSPStream() {
 		}
 		log.Println("[RTSP] - exit ")
 	} else {
-		log.Println("[RTSP] - error", message)
+		log.Println("[RTSP] - error", err)
 	}
 }
 

@@ -45,33 +45,34 @@ func NewRtspClient() *RtspClient {
 }
 
 // main function for working with RTSP
-func (this *RtspClient) Client(rtsp_url string, udp bool) (bool, string) {
+func (this *RtspClient) Client(rtsp_url string, udp bool) error {
 	// check and parse URL
 	if !this.ParseUrl(rtsp_url) {
-		return false, "Invalid URL"
+		return errors.New( "Invalid URL")
 	}
 
 	this.udp = udp
 	// establish connection to the camera
 	if !this.Connect() {
-		return false, "Unable to connect"
+		return errors.New( "Unable to connect")
 	}
 	// phase 1 OPTIONS - first stage of communication with the camera
 	// send OPTIONS request and read response to the OPTIONS request
-	if _, _, err := this.SendRequest("OPTIONS", this.uri, nil); err != nil {
-		return false, "Unable to read OPTIONS response; connection lost"
+	if status, _, _ := this.SendRequest("OPTIONS", this.uri, nil); status != 200 {
+		this.SendRequest("OPTIONS", this.uri, nil)
 	}
+	
 
 	// PHASE 2 DESCRIBE		
 	if status, message, err := this.SendRequest("DESCRIBE", this.uri, nil); err != nil {
-		return false, "Unable to read DESCRIBE response; connection lost?"
+		return errors.New(  "Unable to read DESCRIBE response; connection lost?")
 	} else if status != 200 {
-		return false, "DESCRIBE error; not status code 200 OK " + message
+		return errors.New(  "DESCRIBE error; not status code 200 OK " + message)
 	} else {		
 		this.track = this.ParseMedia(message)
 	}
 	if len(this.track) == 0 {
-		return false, "Error; track not found"
+		return errors.New( "Error; track not found")
 	}
 
 	// PHASE 3 SETUP
@@ -104,7 +105,7 @@ func (this *RtspClient) Client(rtsp_url string, udp bool) (bool, string) {
 	}
 	
 	if status, message, err := this.SendRequest("SETUP", this.uri + "/" + this.track[0], map[string]string{"Transport": transport}); err != nil {
-		return false, "Unable to read SETUP response; connection lost"
+		return errors.New( "Unable to read SETUP response; connection lost")
 	} else if status == 200 {
 			this.session = ParseSession(message)
 			log.Printf("Session : %s", this.session)			
@@ -117,7 +118,7 @@ func (this *RtspClient) Client(rtsp_url string, udp bool) (bool, string) {
 		}
 
 		if status, message, err := this.SendRequest("SETUP", this.uri + "/" + this.track[1], map[string]string{"Transport": transport}); err != nil {
-			return false, "Unable to read SETUP response; connection lost"
+			return errors.New(  "Unable to read SETUP response; connection lost")
 		} else if status == 200 {
 					this.session = ParseSession(message)
 					log.Printf("Session : %s", this.session)
@@ -127,12 +128,12 @@ func (this *RtspClient) Client(rtsp_url string, udp bool) (bool, string) {
 
 	// PHASE 4 PLAY		
 	if status, _, err := this.SendRequest("PLAY", this.uri, map[string]string{"Range": "npt=0-"}); err != nil {
-		return false, "Unable to read PLAY response; connection lost"
+		return errors.New( "Unable to read PLAY response; connection lost")
 	} else if status == 200 {
 		go this.RtspRtpLoop()		
-		return true, "ok"
+		return nil
 	}
-	return false, "other error"
+	return errors.New(  "other error")
 }
 
 /*
@@ -369,7 +370,7 @@ func (this *RtspClient) Close() {
 }
 
 func ParseDirective(header, name string) string {
-	start := strings.Index(header, name + `:"`)
+	start := strings.Index(header, name + `="`)
 	if start == -1 {
 		return ""
 	}
