@@ -20,6 +20,10 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: '1.23'
+    
+    - name: update packages
+      run: |
+        go mod tidy
 
     - name: Build Binary 1
       run: |
