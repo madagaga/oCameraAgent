@@ -4,6 +4,8 @@ import (
     "fmt"
     "io/ioutil"
     "gopkg.in/yaml.v2"
+    "crypto/md5"
+	"encoding/hex"
 )
 
 type Config struct {    
@@ -14,9 +16,9 @@ type Config struct {
         Name string `yaml:"name"`
 
     } `yaml:"mqtt"`
-    Device struct {
-        ID string `yaml:"id"`
+    Device struct {        
         URL string `yaml:"url"`
+        ID string
     } `yaml:"device"`
 }
 
@@ -31,6 +33,10 @@ func loadConfig(filename string) (*Config, error) {
     if err != nil {
         return nil, fmt.Errorf("erreur de parsing du fichier de configuration : %w", err)
     }
+
+    // set device id with md5 of url
+    hash := md5.Sum([]byte(config.Device.URL))
+    config.Device.ID = hex.EncodeToString(hash[:])
 
     return &config, nil
 }
