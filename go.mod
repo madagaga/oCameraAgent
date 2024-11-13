@@ -1,4 +1,4 @@
-module rtsp-webrtc-proxy
+module oCameraAgent
 
 go 1.23.2
 
