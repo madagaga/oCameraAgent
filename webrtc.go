@@ -46,6 +46,7 @@ func NewWebRTCProxy(rtspUrl string) *WebRTCProxy {
         // set the RTSP URL
         rtspUrl: rtspUrl,
     }
+    
     // return the object
     return Obj
 }
@@ -86,6 +87,7 @@ func (this *WebRTCProxy) Close() {
         this.rtspClient.Close()
         //this.rtspClient = nil
     }
+    this.onConnectionStateChanged(false)
 }
 
 
@@ -281,7 +283,8 @@ func (this *WebRTCProxy) StartRTSPStream() {
 		}
 		log.Println("[RTSP] - exit ")
 	} else {
-		log.Println("[RTSP] - error", err)
+		log.Println("[RTSP] - ", err)
+        this.Close()
 	}
 }
 

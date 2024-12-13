@@ -1,5 +1,5 @@
 .vscode/
 test.go
-test_udp.go
+test_*.go
 go.sum
 config.yaml

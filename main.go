@@ -51,7 +51,8 @@ func main() {
     })
 
     webrtcProxy.OnConnectionStateChanged(func(streaming bool) {
-        mqttClient.PublishDeviceInfo(true, streaming)
+        mqttClient.streaming = streaming
+        mqttClient.PublishDeviceInfo()
     })
     
     

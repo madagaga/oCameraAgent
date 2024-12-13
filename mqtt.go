@@ -19,6 +19,8 @@ type MqttClient struct {
     onOfferReceived OnOfferReceivedFunc
     onRemoteICECandidateReceived OnRemoteICECandidateReceivedFunc
     onHangupReceived OnHangupReceivedFunc
+    streaming bool
+    online bool
 }
 
 
@@ -56,6 +58,8 @@ func NewMqttClient(clientId string, username string, password string, url string
         Username: username,
         Password: password,
         URL:      url,
+        streaming: false,
+        online: true,
     }
 
     log.Printf("[MQTT] - Connecting to %s", url)
@@ -87,7 +91,7 @@ func NewMqttClient(clientId string, username string, password string, url string
             log.Println("[MQTT] - Connection established")
             Obj.SubscribeToTopics(Obj.ClientID)
             Obj.SubscribeToTopics("devices")
-            Obj.PublishDeviceInfo(true, false)
+            Obj.PublishDeviceInfo()
         }).
         SetMessageChannelDepth(255).
         SetTLSConfig(tlsconfig).
@@ -137,7 +141,9 @@ func (this *MqttClient) OnHangupReceived (callback OnHangupReceivedFunc) {
 // The method can be called multiple times without any problems.
 func (this *MqttClient) Close() {
     // publish device info message indicating that the device is offline
-    this.PublishDeviceInfo(false, false)
+    this.online = false
+    this.streaming = false
+    this.PublishDeviceInfo()
 
     // disconnect from the MQTT broker
     this.mqttClient.Disconnect(250)
@@ -149,18 +155,18 @@ func (this *MqttClient) Close() {
 //
 // The message contains the device id, name, online status, and streaming status.
 // The message is sent to the "devices" topic and the retained flag is set to true if the device is offline.
-func (this *MqttClient) PublishDeviceInfo(online bool, streaming bool) {
+func (this *MqttClient) PublishDeviceInfo() {
     // create device info message
     payload := SignalingMessage{
         Type:   Device,
-        Data:    []byte(fmt.Sprintf(`{"id": "%s","name": "%s","online": %t, "streaming": %t, "type": "sender"}`, this.ClientID, this.Name, online, streaming)),
+        Data:    []byte(fmt.Sprintf(`{"id": "%s","name": "%s","online": %t, "streaming": %t, "type": "sender"}`, this.ClientID, this.Name, this.online, this.streaming)),
     }
 
     // log message
     log.Printf("[MQTT] - Sending device info %s - %s ", this.Username, this.ClientID)
 
     // send message to the MQTT broker
-    this.Send("devices", payload, !online)
+    this.Send("devices", payload, !this.online)
 }
 
 // SubscribeToTopics subscribes the MQTT client to a given topic and sets up a message handler.
@@ -222,7 +228,7 @@ func (this *MqttClient) HandleMQTTMessage( msg pahomqtt.Message) {
             this.onRemoteICECandidateReceived(signalingMsg.Source, ice)
         case Query:
             log.Printf("[MQTT] - Query request from %s", signalingMsg.Source)
-            this.PublishDeviceInfo(true, false)
+            this.PublishDeviceInfo()
         default:
             log.Printf("[MQTT] - Unhandled message: %s : %s", signalingMsg.Type, msg.Payload())
         }

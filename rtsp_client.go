@@ -352,6 +352,7 @@ func (this *RtspClient) ParseUrl(rtsp_url string) bool {
 	}
 	this.login = u.User.Username()
 	this.password, _ = u.User.Password()
+	log.Printf("host: %s, port: %s, login: %s, password: %s", this.host, this.port, this.login, this.password)
 	this.uri = "rtsp://" + this.host + ":" + this.port + u.Path
 	if u.RawQuery != "" {
 		this.uri += "?" + string(u.RawQuery)
@@ -405,7 +406,7 @@ func (this *RtspClient) ParseMedia(header string) []string {
 	mparsed := strings.Split(header, "\r\n")
 	paste := ""
 	for _, element := range mparsed {
-		if strings.Contains(element, "a=control:") && !strings.Contains(element, "*") && strings.Contains(element, "tra") {
+		if strings.Contains(element, "a=control:") && !strings.Contains(element, "*") {
 			paste = element[10:]
 			if strings.Contains(element, "/") {
 				striped := strings.Split(element, "/")
