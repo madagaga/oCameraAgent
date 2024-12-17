@@ -241,28 +241,6 @@ func (this *RtspClient) RtspRtpLoop() {
 	}
 }
 
-// unsafe!
-func (this *RtspClient) SendBufer(buffer []byte) {
-	// send all packets from the buffer
-	payload := make([]byte, 4096)
-	for {
-		if len(buffer) < 4 {
-			log.Fatal("buffer too small")
-		}
-		dataLength := (int)(buffer[2])<<8 + (int)(buffer[3])
-		if dataLength > len(buffer)+4 {
-			if n, err := io.ReadFull(this.socket, payload[:dataLength-len(buffer)+4]); err != nil {
-				return
-			} else {
-				this.received <- append(buffer, payload[:n]...)
-				return
-			}
-		} else {
-			this.received <- buffer[:dataLength+4]
-			buffer = buffer[dataLength+4:]
-		}
-	}
-}
 
 func (this *RtspClient) Connect() bool {
 	d := &net.Dialer{Timeout: 3 * time.Second}
