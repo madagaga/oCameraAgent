@@ -6,6 +6,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
     "time"
     "errors"
+    "strings"
 )
 
 
@@ -100,15 +101,48 @@ func (wp *WebRTCProxy) Close() {
 //
 // The method is called when the HandleOffer method is called and a new PeerConnection needs to be created.
 func (wp *WebRTCProxy) CreatePeerConnection(from string) error {
-    // Create a new PeerConnection with the given configuration
-    // The configuration contains ICE servers that are used to establish a connection between the peers
-    config := webrtc.Configuration{ICEServers: []webrtc.ICEServer{
-        {
-            URLs: []string{"stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"},
-        },
-    }}
-    // config := webrtc.Configuration{}
-   
+    // Optimisation: Configuration WebRTC adaptative
+    // Utiliser une configuration minimale pour les réseaux locaux
+    // Les serveurs STUN ne sont nécessaires que pour traverser les NAT
+    
+    // Détection basique de réseau local basée sur l'adresse IP
+    isLocalNetwork := strings.HasPrefix(from, "192.168.") || 
+                      strings.HasPrefix(from, "10.") || 
+                      strings.HasPrefix(from, "172.16.") ||
+                      strings.HasPrefix(from, "172.17.") ||
+                      strings.HasPrefix(from, "172.18.") ||
+                      strings.HasPrefix(from, "172.19.") ||
+                      strings.HasPrefix(from, "172.20.") ||
+                      strings.HasPrefix(from, "172.21.") ||
+                      strings.HasPrefix(from, "172.22.") ||
+                      strings.HasPrefix(from, "172.23.") ||
+                      strings.HasPrefix(from, "172.24.") ||
+                      strings.HasPrefix(from, "172.25.") ||
+                      strings.HasPrefix(from, "172.26.") ||
+                      strings.HasPrefix(from, "172.27.") ||
+                      strings.HasPrefix(from, "172.28.") ||
+                      strings.HasPrefix(from, "172.29.") ||
+                      strings.HasPrefix(from, "172.30.") ||
+                      strings.HasPrefix(from, "172.31.")
+    
+    var config webrtc.Configuration
+    
+    if isLocalNetwork {
+        // Configuration minimale pour réseau local - pas de serveurs STUN
+        log.Println("[WEBRTC] - Using local network configuration (no STUN servers)")
+        config = webrtc.Configuration{}
+    } else {
+        // Configuration standard avec serveurs STUN pour traverser les NAT
+        log.Println("[WEBRTC] - Using standard configuration with STUN servers")
+        config = webrtc.Configuration{
+            ICEServers: []webrtc.ICEServer{
+                {
+                    URLs: []string{"stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"},
+                },
+            },
+        }
+    }
+    
     var err error
     wp.peerConnection, err = webrtc.NewPeerConnection(config)
     if err != nil {
@@ -265,30 +299,56 @@ func (wp *WebRTCProxy) StartRTSPStream() {
 
 	if err := wp.rtspClient.Client(wp.rtspUrl, false); err == nil {
 		log.Println("[RTSP] - Connected")
+		
+		// Compteurs pour réduire la fréquence des logs
+		packetCount := 0
+		lastLogTime := time.Now()
+		noPayloadCount := 0
+		
 		for {
 			select {
 			case data := <- wp.rtspClient.received:
 				if len(data) > 12 {
-					//log.Printf("[RTSP] - packet [0]=%x type=%d - %d\n", data[0], data[1], len(data)) //
-						payload, duration := wp.annexBParser.handlePacket(&data)
-						if payload != nil {
-							wp.sendPacket(payload, duration, data[1] == 0 )
-						} else {
-                            log.Println("[RTSP] - no payload")
-                        }					
-
-				} else {
-					log.Println("[RTSP] - Data too short to contain an RTP header")
+					// Traitement du paquet
+					payload, duration := wp.annexBParser.handlePacket(&data)
+					
+					if payload != nil {
+						// Envoyer le paquet au client WebRTC
+						if err := wp.sendPacket(payload, duration, data[1] == 0); err != nil {
+							// Log uniquement en cas d'erreur
+							log.Printf("[RTSP] - Error sending packet: %v", err)
+						}
+						
+						// Incrémenter le compteur de paquets
+						packetCount++
+						
+						// Log périodique (toutes les 5 secondes) pour réduire la charge CPU
+						if time.Since(lastLogTime) > 5*time.Second {
+							log.Printf("[RTSP] - Processed %d packets in last 5 seconds", packetCount)
+							packetCount = 0
+							lastLogTime = time.Now()
+							
+							// Réinitialiser le compteur de paquets sans payload
+							if noPayloadCount > 0 {
+								log.Printf("[RTSP] - %d packets had no payload", noPayloadCount)
+								noPayloadCount = 0
+							}
+						}
+					} else {
+						// Compter les paquets sans payload au lieu de les logger individuellement
+						noPayloadCount++
+					}
+				} else if len(data) > 0 {
+					// Log moins fréquent pour les paquets trop courts
+					log.Println("[RTSP] - Packet too short to contain an RTP header")
 				}
 			case <-wp.rtspClient.signals:
-				log.Println("[RTSP] - exit signal by class rtsp")
+				log.Println("[RTSP] - Exit signal received from RTSP client")
+				return
 			}
 		}
-		log.Println("[RTSP] - exit ")
 	} else {
-		log.Println("[RTSP] - ", err)
+		log.Printf("[RTSP] - Connection error: %v", err)
         wp.Close()
 	}
 }
-
-

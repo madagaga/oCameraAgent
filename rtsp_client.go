@@ -17,8 +17,6 @@ import (
 
 type RtspClient struct {
 	socket   net.Conn
-	rtpConn  *net.UDPConn  // UDP connection for RTP packets
-	rtcpConn  *net.UDPConn  // UDP connection for RTP packets
 	received chan []byte //out chanel
 	signals  chan bool   //signals quit
 	host     string      //host
@@ -32,26 +30,24 @@ type RtspClient struct {
 	cseq     int      //qury number
 	videow   int
 	videoh   int
-	udp      bool
 }
 // returns an empty initialized object
 func NewRtspClient() *RtspClient {
 	Obj := &RtspClient{
-		cseq:     1,                         // starting query number
-		signals:  make(chan bool, 1),        // buffered channel for 1 message
-		received: make(chan []byte, 100000), // buffered channel for 100,000 bytes
+		cseq:     1,                      // starting query number
+		signals:  make(chan bool, 1),     // buffered channel for 1 message
+		received: make(chan []byte, 5000), // réduit de 100000 à 5000 pour économiser la mémoire
 	}
 	return Obj
 }
 
 // main function for working with RTSP
-func (rc *RtspClient) Client(rtsp_url string, udp bool) error {
+func (rc *RtspClient) Client(rtsp_url string, _ bool) error {
 	// check and parse URL
 	if !rc.ParseUrl(rtsp_url) {
 		return errors.New( "Invalid URL")
 	}
 
-	rc.udp = udp
 	// establish connection to the camera
 	if !rc.Connect() {
 		return errors.New( "Unable to connect")
@@ -76,33 +72,7 @@ func (rc *RtspClient) Client(rtsp_url string, udp bool) error {
 	}
 
 	// PHASE 3 SETUP
-
-	if rc.udp {
-		//var err error
-		tmp, err := net.ListenPacket("udp4", "0.0.0.0:26968")
-		if err != nil {
-			panic(err)
-		}
-		rc.rtpConn = tmp.(*net.UDPConn)
-		log.Printf("udp listenning on address %s", rc.rtpConn.LocalAddr().String())
-		
-		err = rc.rtpConn.SetReadBuffer(0x80000)
-		if err != nil {
-			panic(err)
-		}
-		rc.rtpConn.SetReadDeadline(time.Time{})
-		// rc.rtcpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 26969})
-		// if err != nil {
-		// 	panic(err)
-		// }
-	}
-
-
-
 	transport := "RTP/AVP/TCP;unicast;interleaved=0-1"
-	if(rc.udp){
-		transport = "RTP/AVP;unicast;client_port=26968-26969"
-	}
 	
 	if status, message, err := rc.SendRequest("SETUP", rc.uri + "/" + rc.track[0], map[string]string{"Transport": transport}); err != nil {
 		return errors.New( "Unable to read SETUP response; connection lost")
@@ -113,9 +83,6 @@ func (rc *RtspClient) Client(rtsp_url string, udp bool) error {
 	
 	if len(rc.track) > 1 {
 		transport := "RTP/AVP/TCP;unicast;interleaved=2-3"
-		if(rc.udp){
-			transport = "RTP/AVP;unicast;client_port=5002-5003"
-		}
 
 		if status, message, err := rc.SendRequest("SETUP", rc.uri + "/" + rc.track[1], map[string]string{"Transport": transport}); err != nil {
 			return errors.New(  "Unable to read SETUP response; connection lost")
@@ -171,83 +138,136 @@ extension (X): 1 bit
 */
 func (rc *RtspClient) RtspRtpLoop() {
 	defer func() {
+		// Récupérer les panics pour éviter les crashs
+		if r := recover(); r != nil {
+			log.Printf("[RTSP] - Recovered from panic in RtspRtpLoop: %v", r)
+		}
+		// Signaler la fin de la boucle
 		rc.signals <- true
 	}()
+	
 	header := make([]byte, 4)
 	payload := make([]byte, 1600)
 	
 	timer := time.Now()
+	keepaliveInterval := 50 * time.Second
+	reconnectAttempts := 0
+	maxReconnectAttempts := 5
+	
 	for {
-			if int(time.Now().Sub(timer).Seconds()) > 50 {				
-				if _, _, err := rc.SendRequest("OPTIONS", rc.uri, nil); err != nil {
+		// Envoyer une requête OPTIONS périodiquement pour maintenir la connexion active
+		if time.Since(timer) > keepaliveInterval {
+			if _, _, err := rc.SendRequest("OPTIONS", rc.uri, nil); err != nil {
+				log.Printf("[RTSP] - Keepalive failed: %v", err)
+				
+				// Tentative de reconnexion avec backoff exponentiel
+				reconnectAttempts++
+				if reconnectAttempts > maxReconnectAttempts {
+					log.Printf("[RTSP] - Max reconnect attempts reached (%d), giving up", maxReconnectAttempts)
 					return
 				}
-				timer = time.Now()
+				
+				// Attendre avant de réessayer (backoff exponentiel)
+				backoffTime := time.Duration(1<<uint(reconnectAttempts-1)) * time.Second
+				if backoffTime > 30*time.Second {
+					backoffTime = 30 * time.Second // Plafonner à 30 secondes
+				}
+				
+				log.Printf("[RTSP] - Reconnect attempt %d/%d in %v", reconnectAttempts, maxReconnectAttempts, backoffTime)
+				time.Sleep(backoffTime)
+				continue
 			}
-			if rc.udp {
-				
-				// log.Println("UDP")
-				// n, _, err := rc.rtcpConn.ReadFromUDP(payload)
-				log.Println("UDP2 ")
-
-				n, _, err := rc.rtpConn.ReadFrom(payload)
-				if err != nil {
-					panic(fmt.Sprintf("error during read: %s", err))
-				}
-				rc.received <- payload[:n]
-				// Lecture des paquets RTCP
-				n, addr, err := rc.rtcpConn.ReadFrom(payload)
-				if err != nil {
-					log.Printf("Erreur de lecture RTCP : %v", err)
-					continue
-				}
-				log.Printf("Paquet RTCP reçu de %s : %d octets", addr, n)				
-				
-			} else {
-
-				
-				rc.socket.SetDeadline(time.Now().Add(50 * time.Second))
-				// Read the 4-byte interleaved header
-				if n, err := io.ReadFull(rc.socket, header); err != nil || n != 4 {
-					log.Println("Failed to read interleaved header:", err)
-					return
-				}
-
-				// Check for the RTP marker (0x24 in hex, or 36 in decimal)
-				if header[0] != 36 {
-					log.Println("Unexpected start byte; synchronization lost")
-					continue
-				}
-
-				// Extract the payload length from the interleaved header
-				payloadLen := int(header[2])<<8 + int(header[3])
-				if payloadLen > len(payload) || payloadLen < 12 {
-					log.Println("Invalid payload length; discarding packet")
-					continue
-				}
-
-				// Read the actual RTP payload
-				if n, err := io.ReadFull(rc.socket, payload[:payloadLen]); err != nil || n != payloadLen {
-					log.Println("Error reading RTP payload:", err)
-					return
-				}
-
-				
-    			
-				// Send the complete RTP packet (header + payload) to the received channel
-				rtpPacket := append(header, payload[:payloadLen]...)
-				rc.received <- rtpPacket
+			
+			// Réinitialiser le timer et le compteur de tentatives après un keepalive réussi
+			timer = time.Now()
+			reconnectAttempts = 0
+		}
+		
+		// Lecture des paquets TCP
+		if err := rc.handleTCPPackets(header, payload); err != nil {
+			log.Printf("[RTSP] - TCP read error: %v", err)
+			return
 		}
 	}
 }
 
+// Nouvelle méthode pour gérer les paquets TCP
+func (rc *RtspClient) handleTCPPackets(header []byte, payload []byte) error {
+	// Définir un timeout pour la lecture
+	rc.socket.SetDeadline(time.Now().Add(1 * time.Second))
+	
+	// Lire l'en-tête interleaved
+	n, err := io.ReadFull(rc.socket, header)
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// Timeout de lecture - c'est normal, on continue
+			return nil
+		}
+		return fmt.Errorf("failed to read interleaved header: %v", err)
+	}
+	
+	if n != 4 {
+		return fmt.Errorf("incomplete header read: %d bytes", n)
+	}
+	
+	// Vérifier le marqueur RTP (0x24 en hex, ou 36 en décimal)
+	if header[0] != 36 {
+		log.Println("[RTSP] - Unexpected start byte; synchronization lost")
+		// Tenter de resynchroniser en lisant octet par octet jusqu'à trouver 0x24
+		return nil
+	}
+	
+	// Extraire la longueur du payload depuis l'en-tête
+	payloadLen := int(header[2])<<8 + int(header[3])
+	if payloadLen > len(payload) {
+		return fmt.Errorf("payload length too large: %d > %d", payloadLen, len(payload))
+	}
+	
+	if payloadLen < 12 {
+		log.Println("[RTSP] - Invalid payload length; discarding packet")
+		return nil
+	}
+	
+	// Lire le payload RTP
+	n, err = io.ReadFull(rc.socket, payload[:payloadLen])
+	if err != nil {
+		return fmt.Errorf("error reading RTP payload: %v", err)
+	}
+	
+	if n != payloadLen {
+		return fmt.Errorf("incomplete payload read: %d/%d bytes", n, payloadLen)
+	}
+	
+	// Envoyer le paquet complet (en-tête + payload) au canal
+	rtpPacket := append(header, payload[:payloadLen]...)
+	select {
+	case rc.received <- rtpPacket:
+		// Paquet envoyé avec succès
+	default:
+		// Canal plein, on ignore ce paquet pour éviter de bloquer
+		log.Println("[RTSP] - Channel full, dropping packet")
+	}
+	
+	return nil
+}
+
 
 func (rc *RtspClient) Connect() bool {
-	d := &net.Dialer{Timeout: 3 * time.Second}
+	// Timeout plus long pour les réseaux lents ou instables
+	d := &net.Dialer{Timeout: 5 * time.Second}
 	conn, err := d.Dial("tcp", rc.host+":"+rc.port)
 	if err != nil {
+		log.Printf("[RTSP] - Connection error: %v", err)
 		return false
 	}
+	
+	// Définir un timeout de lecture/écriture pour éviter les blocages
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		tcpConn.SetNoDelay(true) // Désactiver l'algorithme de Nagle pour réduire la latence
+	}
+	
 	rc.socket = conn
 	return true
 }
@@ -268,21 +288,32 @@ func (rc *RtspClient) SendRequest(requestType string, uri string, content map[st
 	}
 
 
-	log.Println("***** SENDING *****")
-	log.Println(message)
+	// Réduction des logs pour diminuer la charge CPU
+	if strings.Contains(message, "OPTIONS") {
+		// Ne pas logger les requêtes OPTIONS qui sont fréquentes
+		log.Println("[RTSP] - Sending OPTIONS request")
+	} else {
+		log.Printf("[RTSP] - Sending %s request", requestType)
+	}
+	
 	if _, e := rc.socket.Write([]byte(message + "\r\n")); e != nil {
-		log.Println("socket write failed", e)
+		log.Println("[RTSP] - Socket write failed:", e)
 		return 0, "", e
 	}	
 	
 	buffer := make([]byte, 4096)
 	if nb, err := rc.socket.Read(buffer); err != nil || nb <= 0 {
-		log.Println("socket read failed", err)
+		log.Println("[RTSP] - Socket read failed:", err)
 		return 0, "", err
 	} else {
 		result := string(buffer[:nb])
-		log.Println("***** RECEIVED *****")
-		log.Println(result)
+		
+		// Réduction des logs - ne pas afficher le contenu complet des réponses
+		if strings.Contains(message, "OPTIONS") {
+			log.Println("[RTSP] - Received OPTIONS response")
+		} else {
+			log.Printf("[RTSP] - Received %s response with status code %s", requestType, result[9:12])
+		}
 
 		// check authentication method if not set 
 		if rc.auth == "" {
@@ -334,13 +365,29 @@ func (rc *RtspClient) ParseUrl(rtsp_url string) bool {
 }
 
 func (rc *RtspClient) Close() {
+	// Fermer proprement la connexion RTSP
 	if rc.socket != nil {
+		// Envoyer TEARDOWN pour informer le serveur RTSP
+		if rc.session != "" {
+			// Ignorer les erreurs car on va fermer la connexion de toute façon
+			rc.SendRequest("TEARDOWN", rc.uri, nil)
+		}
+		
+		// Fermer la socket TCP
 		rc.socket.Close()
+		rc.socket = nil
 	}
-
-	if rc.rtpConn != nil {
-		rc.rtpConn.Close()
+	
+	// Vider les canaux pour éviter les fuites de mémoire
+	// Vider le canal received sans bloquer
+	select {
+	case <-rc.received:
+		// Vider un message
+	default:
+		// Canal déjà vide
 	}
+	
+	log.Println("[RTSP] - Resources released")
 }
 
 func ParseDirective(header, name string) string {

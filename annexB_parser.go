@@ -131,7 +131,10 @@ func (this *AnnexBParser) handlePacket(data *[]byte) ([]byte , uint32){
 func (this *AnnexBParser) parseNalu(data []byte, timestamp uint32) ([]byte, uint32) {
 	naluType  := data[0] & 0x1F
 
-	log.Printf("[H264] - nal type : %d - ts : %d", naluType, timestamp)
+	// Réduction des logs pour diminuer la charge CPU - seulement pour les types importants
+	if naluType == 5 || naluType == NALU_SPS || naluType == NALU_PPS {
+		log.Printf("[H264] - nal type : %d - ts : %d", naluType, timestamp)
+	}
 	switch {
 	case naluType  >= 1 && naluType  <= 5:
 		return this.handleNALU(naluType , data, timestamp)
@@ -194,26 +197,39 @@ func (this *AnnexBParser) parseNalu(data []byte, timestamp uint32) ([]byte, uint
 }
 
 func (this *AnnexBParser) handleNALU(naluType byte, payload []byte, ts uint32) ([]byte, uint32) {
-    
-
     // Calculate the duration since the last packet was processed
     duration := ts - this.videoTS
-    log.Printf("[H264] - duration : %d", duration)
+    
+    // Réduction des logs pour diminuer la charge CPU
+    if duration > 5000 {
+        log.Printf("[H264] - duration : %d", duration)
+    }
 
     // Check if the NAL unit type is a keyframe
     if naluType == 5 {
-        log.Println("[H264] - keyframe")
-        // Prepend start code, PPS, and SPS to the payload for keyframe
-        payload = append(this.startCode, payload...) // Prepend start code
-        payload = append(this.pps, payload...)       // Prepend PPS
-        payload = append(this.startCode, payload...) // Prepend another start code
-        payload = append(this.sps, payload...)       // Prepend SPS
-        payload = append(this.startCode, payload...) // Prepend final start code
+        // Log moins fréquent
+        if duration > 5000 {
+            log.Println("[H264] - keyframe")
+        }
+        
+        // Optimisation: préallocation du buffer pour éviter les multiples append coûteux
+        totalSize := len(this.startCode)*3 + len(this.pps) + len(this.sps) + len(payload)
+        optimizedPayload := make([]byte, 0, totalSize)
+        
+        // Construction du buffer en une seule passe
+        optimizedPayload = append(optimizedPayload, this.startCode...)
+        optimizedPayload = append(optimizedPayload, this.sps...)
+        optimizedPayload = append(optimizedPayload, this.startCode...)
+        optimizedPayload = append(optimizedPayload, this.pps...)
+        optimizedPayload = append(optimizedPayload, this.startCode...)
+        optimizedPayload = append(optimizedPayload, payload...)
+        
+        payload = optimizedPayload
     } 
 
     // Update previous timestamp to current timestamp
     this.videoTS = ts
-	return payload, duration
+    return payload, duration
 }
 
 
@@ -312,4 +328,4 @@ func (this *AnnexBParser) updateSPS(b []byte) {
 	this.sps = b
 	log.Printf("[H264] - sps: %v" ,this.sps)
 	}
-}	
+}
