@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"errors"
 )
@@ -191,6 +192,15 @@ func (rc *RtspClient) RtspRtpLoop() {
 	}
 }
 
+// Buffer préalloué pour les paquets RTP complets (en-tête + payload)
+// Cela évite des allocations répétées qui créent de la pression sur le GC
+var rtpPacketPool = sync.Pool{
+	New: func() interface{} {
+		// Préallouer un buffer de taille suffisante pour la plupart des paquets
+		return make([]byte, 0, 2048)
+	},
+}
+
 // Nouvelle méthode pour gérer les paquets TCP
 func (rc *RtspClient) handleTCPPackets(header []byte, payload []byte) error {
 	// Définir un timeout pour la lecture
@@ -238,13 +248,23 @@ func (rc *RtspClient) handleTCPPackets(header []byte, payload []byte) error {
 		return fmt.Errorf("incomplete payload read: %d/%d bytes", n, payloadLen)
 	}
 	
-	// Envoyer le paquet complet (en-tête + payload) au canal
-	rtpPacket := append(header, payload[:payloadLen]...)
+	// Obtenir un buffer du pool et l'utiliser pour construire le paquet complet
+	// Cela évite des allocations mémoire répétées
+	rtpPacket := rtpPacketPool.Get().([]byte)
+	rtpPacket = rtpPacket[:0] // Réinitialiser le buffer sans réallouer
+	
+	// Construire le paquet complet (en-tête + payload)
+	rtpPacket = append(rtpPacket, header...)
+	rtpPacket = append(rtpPacket, payload[:payloadLen]...)
+	
+	// Envoyer le paquet au canal, avec gestion de la non-disponibilité
 	select {
 	case rc.received <- rtpPacket:
 		// Paquet envoyé avec succès
 	default:
 		// Canal plein, on ignore ce paquet pour éviter de bloquer
+		// Remettre le buffer dans le pool pour réutilisation
+		rtpPacketPool.Put(rtpPacket)
 		log.Println("[RTSP] - Channel full, dropping packet")
 	}
 	
@@ -273,35 +293,75 @@ func (rc *RtspClient) Connect() bool {
 }
 
 
+// Buffer réutilisable pour les requêtes RTSP
+var requestBufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(strings.Builder)
+	},
+}
+
+// Buffer réutilisable pour les réponses RTSP
+var responseBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 4096)
+	},
+}
+
 func (rc *RtspClient) SendRequest(requestType string, uri string, content map[string]string) (int, string, error) {
 	rc.cseq += 1
-	message := requestType + " " + uri + " RTSP/1.0\r\nUser-Agent: rtsp-client\r\nAccept: application/sdp\r\nCSeq: " + strconv.Itoa(rc.cseq) + "\r\n"
+	
+	// Obtenir un buffer du pool pour construire la requête
+	sb := requestBufferPool.Get().(*strings.Builder)
+	sb.Reset() // Réinitialiser le buffer
+	defer requestBufferPool.Put(sb) // Remettre le buffer dans le pool quand on a fini
+	
+	// Construire la requête de manière efficace
+	sb.WriteString(requestType)
+	sb.WriteString(" ")
+	sb.WriteString(uri)
+	sb.WriteString(" RTSP/1.0\r\nUser-Agent: rtsp-client\r\nAccept: application/sdp\r\nCSeq: ")
+	sb.WriteString(strconv.Itoa(rc.cseq))
+	sb.WriteString("\r\n")
+	
 	if rc.auth != "" {
-		message += rc.auth + "\r\n"
+		sb.WriteString(rc.auth)
+		sb.WriteString("\r\n")
 	}
+	
 	for k, v := range content {
-		message += k + ": " + v + "\r\n"
+		sb.WriteString(k)
+		sb.WriteString(": ")
+		sb.WriteString(v)
+		sb.WriteString("\r\n")
 	}
 
 	if rc.session != "" {
-		message += "Session: " + rc.session + "\r\n"
+		sb.WriteString("Session: ")
+		sb.WriteString(rc.session)
+		sb.WriteString("\r\n")
 	}
-
+	
+	sb.WriteString("\r\n")
+	message := sb.String()
 
 	// Réduction des logs pour diminuer la charge CPU
-	if strings.Contains(message, "OPTIONS") {
+	isOptions := requestType == "OPTIONS"
+	if isOptions {
 		// Ne pas logger les requêtes OPTIONS qui sont fréquentes
 		log.Println("[RTSP] - Sending OPTIONS request")
 	} else {
 		log.Printf("[RTSP] - Sending %s request", requestType)
 	}
 	
-	if _, e := rc.socket.Write([]byte(message + "\r\n")); e != nil {
+	if _, e := rc.socket.Write([]byte(message)); e != nil {
 		log.Println("[RTSP] - Socket write failed:", e)
 		return 0, "", e
 	}	
 	
-	buffer := make([]byte, 4096)
+	// Obtenir un buffer du pool pour la réponse
+	buffer := responseBufferPool.Get().([]byte)
+	defer responseBufferPool.Put(buffer)
+	
 	if nb, err := rc.socket.Read(buffer); err != nil || nb <= 0 {
 		log.Println("[RTSP] - Socket read failed:", err)
 		return 0, "", err
@@ -309,7 +369,7 @@ func (rc *RtspClient) SendRequest(requestType string, uri string, content map[st
 		result := string(buffer[:nb])
 		
 		// Réduction des logs - ne pas afficher le contenu complet des réponses
-		if strings.Contains(message, "OPTIONS") {
+		if isOptions {
 			log.Println("[RTSP] - Received OPTIONS response")
 		} else {
 			log.Printf("[RTSP] - Received %s response with status code %s", requestType, result[9:12])
@@ -323,23 +383,38 @@ func (rc *RtspClient) SendRequest(requestType string, uri string, content map[st
 				hs1 := GetMD5Hash(rc.login + ":" + realm + ":" + rc.password)
 				hs2 := GetMD5Hash(requestType + ":" + rc.uri)
 				response := GetMD5Hash(hs1 + ":" + nonce + ":" + hs2)
-				rc.auth = `Authorization: Digest username="` + rc.login + `", realm="` + realm + `", nonce="` + nonce + `", uri="` + rc.uri + `", response="` + response + `"`
+				
+				// Construire l'en-tête d'authentification de manière efficace
+				var authBuilder strings.Builder
+				authBuilder.WriteString(`Authorization: Digest username="`)
+				authBuilder.WriteString(rc.login)
+				authBuilder.WriteString(`", realm="`)
+				authBuilder.WriteString(realm)
+				authBuilder.WriteString(`", nonce="`)
+				authBuilder.WriteString(nonce)
+				authBuilder.WriteString(`", uri="`)
+				authBuilder.WriteString(rc.uri)
+				authBuilder.WriteString(`", response="`)
+				authBuilder.WriteString(response)
+				authBuilder.WriteString(`"`)
+				rc.auth = authBuilder.String()
 	
 			} else if strings.Contains(result, "Basic") {
-				rc.auth = "\r\nAuthorization: Basic " + b64.StdEncoding.EncodeToString([]byte(rc.login+":"+rc.password))	
+				rc.auth = "Authorization: Basic " + b64.StdEncoding.EncodeToString([]byte(rc.login+":"+rc.password))
 			}
 			// resend request 
 		}
 
 		// extract status code : RTSP/1.0 200 OK convert to int
-		statusCode, _ := strconv.Atoi(result[9:9+3])
+		statusCode := 0
+		if len(result) >= 12 {
+			statusCode, _ = strconv.Atoi(result[9:12])
+		}
 
 		return statusCode, result, nil
 	}
 
 	return 0, "", errors.New("unknown error")
-
-
 }
 
 func (rc *RtspClient) ParseUrl(rtsp_url string) bool {
@@ -421,24 +496,47 @@ func GetMD5Hash(text string) string {
 	hash := md5.Sum([]byte(text))
 	return hex.EncodeToString(hash[:])
 }
+// Constantes pour éviter les allocations de chaînes répétées
+const (
+	controlPrefix     = "a=control:"
+	dimensionsPrefix  = "a=x-dimensions:"
+	controlPrefixLen  = len(controlPrefix)
+	dimensionsPrefixLen = len(dimensionsPrefix)
+)
+
+// Pool de slices pour les dimensions
+var dimsPool = sync.Pool{
+	New: func() interface{} {
+		return make([]int, 0, 2)
+	},
+}
+
 func (rc *RtspClient) ParseMedia(header string) []string {
-	letters := []string{}
+	// Préallouer le slice pour éviter les réallocations
+	letters := make([]string, 0, 2) // La plupart des flux ont 1-2 pistes
+	
+	// Éviter de réallouer un slice pour chaque ligne
 	mparsed := strings.Split(header, "\r\n")
-	paste := ""
+	
 	for _, element := range mparsed {
-		if strings.Contains(element, "a=control:") && !strings.Contains(element, "*") {
-			paste = element[10:]
-			if strings.Contains(element, "/") {
-				striped := strings.Split(element, "/")
-				paste = striped[len(striped)-1]
+		// Recherche de contrôle de piste
+		if idx := strings.Index(element, controlPrefix); idx != -1 && !strings.Contains(element, "*") {
+			paste := element[idx+controlPrefixLen:]
+			if slashIdx := strings.LastIndex(paste, "/"); slashIdx != -1 {
+				paste = paste[slashIdx+1:]
 			}
 			letters = append(letters, paste)
 		}
 
-		dimensionsPrefix := "a=x-dimensions:"
+		// Recherche de dimensions
 		if strings.HasPrefix(element, dimensionsPrefix) {
-			dims := []int{}
-			for _, s := range strings.Split(element[len(dimensionsPrefix):], ",") {
+			// Obtenir un slice du pool
+			dims := dimsPool.Get().([]int)
+			dims = dims[:0] // Réinitialiser sans réallouer
+			
+			// Analyser les dimensions
+			dimPart := element[dimensionsPrefixLen:]
+			for _, s := range strings.Split(dimPart, ",") {
 				v := 0
 				fmt.Sscanf(s, "%d", &v)
 				if v <= 0 {
@@ -446,11 +544,17 @@ func (rc *RtspClient) ParseMedia(header string) []string {
 				}
 				dims = append(dims, v)
 			}
+			
+			// Utiliser les dimensions si valides
 			if len(dims) == 2 {
 				rc.videow = dims[0]
 				rc.videoh = dims[1]
 			}
+			
+			// Remettre le slice dans le pool
+			dimsPool.Put(dims)
 		}
 	}
+	
 	return letters
 }
