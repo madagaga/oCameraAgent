@@ -20,7 +20,7 @@ func main() {
     }
 
     // build proxy client
-    webrtcProxy := NewWebRTCProxy(config.Device.URL)
+    webrtcProxy := NewWebRTCProxy(config.Device)
     
     // build signaling 
     mqttClient := NewMqttClient(config.Device.ID, config.MQTT.Username, config.MQTT.Password, config.MQTT.URL)

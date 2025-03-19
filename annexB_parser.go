@@ -5,7 +5,7 @@ import (
 	"bytes"
 )
 
-type Demuxer struct {
+type AnnexBParser struct {
 	startCode []byte
 	videoTS uint32
 	audioTS uint32
@@ -28,21 +28,21 @@ const (
 	NALU_AUD = 9
 )
 
-func NewDemuxer() *Demuxer {
-	Obj := &Demuxer{
+func NewAnnexBParser() *AnnexBParser {
+	Obj := &AnnexBParser{
 		startCode: []byte{0x00, 0x00, 0x00, 0x01},
 		fuBuffer:  bytes.NewBuffer([]byte{}),
 	}
 	return Obj
 }
-func (this *Demuxer) reset() {
+func (this *AnnexBParser) reset() {
 	this.videoTS = 0
 	this.audioTS = 0
 	this.fuBuffer.Reset()
 	this.fuStarted = false
 }
 
-func (this *Demuxer) handlePacket(data *[]byte) ([]byte , uint32){
+func (this *AnnexBParser) handlePacket(data *[]byte) ([]byte , uint32){
 	content := *data
 	
     if len(content) < 4 {
@@ -120,26 +120,21 @@ func (this *Demuxer) handlePacket(data *[]byte) ([]byte , uint32){
 		}
 		
 		duration := timestamp - this.audioTS		
-		// audioPayload := rtpPacket[offset:end]
-        // log.Printf("[Audio] - Extracted PCMA payload of size %d bytes", len(audioPayload))
-
-        // // Decode PCMA to PCM
-        // pcmData := this.decodePCMA(audioPayload)
-        // log.Printf("[Audio] - Decoded PCM data of size %d bytes", len(pcmData))
-
 		this.audioTS = timestamp
-		return rtpPacket[offset:end],duration
-		
+		return rtpPacket[offset:end],duration		
 	}
 
 	return nil, 0
 	
 }
 
-func (this *Demuxer) parseNalu(data []byte, timestamp uint32) ([]byte, uint32) {
+func (this *AnnexBParser) parseNalu(data []byte, timestamp uint32) ([]byte, uint32) {
 	naluType  := data[0] & 0x1F
 
-	log.Printf("[H264] - nal type : %d - ts : %d", naluType, timestamp)
+	// Reduce logging to decrease CPU usage - only for important types
+	if naluType == 5 || naluType == NALU_SPS || naluType == NALU_PPS {
+		log.Printf("[H264] - nal type : %d - ts : %d", naluType, timestamp)
+	}
 	switch {
 	case naluType  >= 1 && naluType  <= 5:
 		return this.handleNALU(naluType , data, timestamp)
@@ -201,32 +196,45 @@ func (this *Demuxer) parseNalu(data []byte, timestamp uint32) ([]byte, uint32) {
 	return nil, 0
 }
 
-func (this *Demuxer) handleNALU(naluType byte, payload []byte, ts uint32) ([]byte, uint32) {
-    
-
+func (this *AnnexBParser) handleNALU(naluType byte, payload []byte, ts uint32) ([]byte, uint32) {
     // Calculate the duration since the last packet was processed
     duration := ts - this.videoTS
-    log.Printf("[H264] - duration : %d", duration)
+    
+    // Reduce logging to decrease CPU usage
+    if duration > 5000 {
+        log.Printf("[H264] - duration : %d", duration)
+    }
 
     // Check if the NAL unit type is a keyframe
     if naluType == 5 {
-        log.Println("[H264] - keyframe")
-        // Prepend start code, PPS, and SPS to the payload for keyframe
-        payload = append(this.startCode, payload...) // Prepend start code
-        payload = append(this.pps, payload...)       // Prepend PPS
-        payload = append(this.startCode, payload...) // Prepend another start code
-        payload = append(this.sps, payload...)       // Prepend SPS
-        payload = append(this.startCode, payload...) // Prepend final start code
+        // Less frequent logging
+        if duration > 5000 {
+            log.Println("[H264] - keyframe")
+        }
+        
+        // Optimization: preallocate buffer to avoid costly multiple appends
+        totalSize := len(this.startCode)*3 + len(this.pps) + len(this.sps) + len(payload)
+        optimizedPayload := make([]byte, 0, totalSize)
+        
+        // Build the buffer in a single pass
+        optimizedPayload = append(optimizedPayload, this.startCode...)
+        optimizedPayload = append(optimizedPayload, this.sps...)
+        optimizedPayload = append(optimizedPayload, this.startCode...)
+        optimizedPayload = append(optimizedPayload, this.pps...)
+        optimizedPayload = append(optimizedPayload, this.startCode...)
+        optimizedPayload = append(optimizedPayload, payload...)
+        
+        payload = optimizedPayload
     } 
 
     // Update previous timestamp to current timestamp
     this.videoTS = ts
-	return payload, duration
+    return payload, duration
 }
 
 
 
-func (this *Demuxer) splitNALUs(b []byte) (nalus [][]byte, typ int) {
+func (this *AnnexBParser) splitNALUs(b []byte) (nalus [][]byte, typ int) {
 	// Check if there's enough data to do anything meaningful
 	if len(b) < 4 {
 		return [][]byte{b}, NALU_RAW
@@ -300,24 +308,24 @@ func (this *Demuxer) splitNALUs(b []byte) (nalus [][]byte, typ int) {
 	return [][]byte{b}, NALU_RAW
 }
 
-func (this *Demuxer) U24BE(b []byte) uint32 {
+func (this *AnnexBParser) U24BE(b []byte) uint32 {
 	return uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
 }
 
-func (this *Demuxer) U32BE(b []byte) uint32 {
+func (this *AnnexBParser) U32BE(b []byte) uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
-func (this *Demuxer) updatePPS(b []byte) {
+func (this *AnnexBParser) updatePPS(b []byte) {
 	if(len(this.pps) == 0) {
 	this.pps = b
 	log.Printf("[H264] - pps: %v" ,this.pps)
 	}
 }
 
-func (this *Demuxer) updateSPS(b []byte) {
+func (this *AnnexBParser) updateSPS(b []byte) {
 	if(len(this.sps) == 0) {
 	this.sps = b
 	log.Printf("[H264] - sps: %v" ,this.sps)
 	}
-}	
+}

@@ -6,6 +6,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
     "time"
     "errors"
+    "strings"
 )
 
 
@@ -16,7 +17,10 @@ type WebRTCProxy struct {
 
     rtspUrl string
     rtspClient *RtspClient
-    demuxer *Demuxer
+    annexBParser *AnnexBParser
+
+    videoCodec string
+    audioCodec string
 
     onLocalICECandidateReceived OnLocalICECandidateReceivedFunc
     onConnectionStateChanged OnConnectionStateChangedFunc
@@ -35,16 +39,18 @@ type OnConnectionStateChangedFunc func(conencted bool)
 //
 // The object is not started automatically, the Start() method must be
 // called to start the proxy.
-func NewWebRTCProxy(rtspUrl string) *WebRTCProxy {
+func NewWebRTCProxy(device Device) *WebRTCProxy {
     // log the URL to the console
-    log.Printf("[WEBRTC] - url : %s", rtspUrl)
+    log.Printf("[WEBRTC] - url : %s", device.URL)
     
     // create a new object
     Obj := &WebRTCProxy{
-        // create a new demuxer
-        demuxer: NewDemuxer(),
+        // create a new annexBParser
+        annexBParser: NewAnnexBParser(),
         // set the RTSP URL
-        rtspUrl: rtspUrl,
+        rtspUrl: device.URL,
+        audioCodec: "audio/" + device.Audio,
+        videoCodec: "video/" + device.Video,
     }
     
     // return the object
@@ -57,103 +63,134 @@ func NewWebRTCProxy(rtspUrl string) *WebRTCProxy {
 //
 // The callback is called with the source of the candidate and the candidate itself.
 // The source is the identifier of the peer that sent the candidate.
-func (this *WebRTCProxy) OnLocalICECandidateReceived(callback OnLocalICECandidateReceivedFunc) {
-    this.onLocalICECandidateReceived = callback
+func (wp *WebRTCProxy) OnLocalICECandidateReceived(callback OnLocalICECandidateReceivedFunc) {
+    wp.onLocalICECandidateReceived = callback
 }
 
 
 // OnConnectionStateChanged sets a callback for when the connection state of the peer connection changes
 //
 // The callback is called with a boolean argument indicating whether the connection is established or not.
-func (this *WebRTCProxy) OnConnectionStateChanged(callback OnConnectionStateChangedFunc) {
-    this.onConnectionStateChanged = callback
+func (wp *WebRTCProxy) OnConnectionStateChanged(callback OnConnectionStateChangedFunc) {
+    wp.onConnectionStateChanged = callback
 }
 
 
 // Close the WebRTC connection and the RTSP connection.
 //
-// This method can be called multiple times without any problems.
-func (this *WebRTCProxy) Close() {
+// wp method can be called multiple times without any problems.
+func (wp *WebRTCProxy) Close() {
     // Close the WebRTC connection if it exists
-    if this.peerConnection != nil {
+    if wp.peerConnection != nil {
         log.Println("[WEBRTC] - Closing WebRTC connection...")
-        this.peerConnection.Close()
-        this.peerConnection = nil
+        wp.peerConnection.Close()
+        wp.peerConnection = nil
     }
 
     // Close the RTSP connection if it exists
-    if this.rtspClient != nil {
+    if wp.rtspClient != nil {
         log.Println("[RTSP] - Disconnecting from RTSP...")
-        this.rtspClient.Close()
-        //this.rtspClient = nil
+        wp.rtspClient.Close()
+        //wp.rtspClient = nil
     }
-    this.onConnectionStateChanged(false)
+    wp.onConnectionStateChanged(false)
 }
 
 
 // CreatePeerConnection creates a new PeerConnection and adds the video and audio tracks to it
 //
 // The method is called when the HandleOffer method is called and a new PeerConnection needs to be created.
-func (this *WebRTCProxy) CreatePeerConnection(from string) error {
-    // Create a new PeerConnection with the given configuration
-    // The configuration contains ICE servers that are used to establish a connection between the peers
-    config := webrtc.Configuration{ICEServers: []webrtc.ICEServer{
-        {
-            URLs: []string{"stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"},
-        },
-    }}
-    // config := webrtc.Configuration{}
-   
+func (wp *WebRTCProxy) CreatePeerConnection(from string) error {
+    // Optimization: Adaptive WebRTC configuration
+    // Use minimal configuration for local networks
+    // STUN servers are only necessary for NAT traversal
+    
+    // Basic local network detection based on IP address
+    isLocalNetwork := strings.HasPrefix(from, "192.168.") || 
+                      strings.HasPrefix(from, "10.") || 
+                      strings.HasPrefix(from, "172.16.") ||
+                      strings.HasPrefix(from, "172.17.") ||
+                      strings.HasPrefix(from, "172.18.") ||
+                      strings.HasPrefix(from, "172.19.") ||
+                      strings.HasPrefix(from, "172.20.") ||
+                      strings.HasPrefix(from, "172.21.") ||
+                      strings.HasPrefix(from, "172.22.") ||
+                      strings.HasPrefix(from, "172.23.") ||
+                      strings.HasPrefix(from, "172.24.") ||
+                      strings.HasPrefix(from, "172.25.") ||
+                      strings.HasPrefix(from, "172.26.") ||
+                      strings.HasPrefix(from, "172.27.") ||
+                      strings.HasPrefix(from, "172.28.") ||
+                      strings.HasPrefix(from, "172.29.") ||
+                      strings.HasPrefix(from, "172.30.") ||
+                      strings.HasPrefix(from, "172.31.")
+    
+    var config webrtc.Configuration
+    
+    if isLocalNetwork {
+        // Minimal configuration for local network - no STUN servers
+        log.Println("[WEBRTC] - Using local network configuration (no STUN servers)")
+        config = webrtc.Configuration{}
+    } else {
+        // Standard configuration with STUN servers for NAT traversal
+        log.Println("[WEBRTC] - Using standard configuration with STUN servers")
+        config = webrtc.Configuration{
+            ICEServers: []webrtc.ICEServer{
+                {
+                    URLs: []string{"stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"},
+                },
+            },
+        }
+    }
+    
     var err error
-    this.peerConnection, err = webrtc.NewPeerConnection(config)
+    wp.peerConnection, err = webrtc.NewPeerConnection(config)
     if err != nil {
         log.Printf("[WEBRTC] - Error while creating PeerConnection: %v", err)
         return err
     }
 
     // Set a callback for when an ICE candidate is received
-    this.peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+    wp.peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
         if candidate != nil {      
-            this.onLocalICECandidateReceived(from, candidate)                  
+            wp.onLocalICECandidateReceived(from, candidate)                  
         }
     })
 
     // Set a callback for when the connection state of the peer connection changes
-    this.peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+    wp.peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
         log.Printf("[WEBRTC] - Connection state: %s", state.String())
-        if state == webrtc.PeerConnectionStateFailed {
-            log.Println("[WEBRTC] - Connection failed. Closing rtsp connection...")
-            this.rtspClient.Close()
-            this.onConnectionStateChanged(false)
-            
-
+        if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected{
+            log.Println("[WEBRTC] - Closing rtsp connection...")
+            wp.rtspClient.Close()
+            wp.onConnectionStateChanged(false)
         } else if state == webrtc.PeerConnectionStateConnected {
-            go this.StartRTSPStream()
-            this.onConnectionStateChanged(true)
+            go wp.StartRTSPStream()
+            wp.onConnectionStateChanged(true)
             
         }
     })
 
     // Set a callback for when the signaling state of the peer connection changes
-    this.peerConnection.OnSignalingStateChange(func(state webrtc.SignalingState) {
+    wp.peerConnection.OnSignalingStateChange(func(state webrtc.SignalingState) {
         log.Printf("[WEBRTC] - Signaling state: %s", state.String())
     })
 
     // Create a new video track and add it to the peer connection
-    this.videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "rtsp-video")
+    wp.videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: wp.videoCodec}, "video", "rtsp-video")
     if err != nil {
         return  err
     }
     
-    _, err = this.peerConnection.AddTrack(this.videoTrack)
+    _, err = wp.peerConnection.AddTrack(wp.videoTrack)
     if err != nil {
         return err
     }
     
     // Create a new audio track and add it to the peer connection
-    this.audioTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMA}, "audio", "rtsp-audio")
+    wp.audioTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: wp.audioCodec}, "audio", "rtsp-audio")
     if err == nil {
-        _, err = this.peerConnection.AddTrack(this.audioTrack)
+        _, err = wp.peerConnection.AddTrack(wp.audioTrack)
         if err != nil {
             return  err
         }
@@ -167,15 +204,15 @@ func (this *WebRTCProxy) CreatePeerConnection(from string) error {
 
 // AddICECandidate adds an ICE candidate to the existing PeerConnection.
 // Returns an error if the PeerConnection is nil or if adding the candidate fails.
-func (this *WebRTCProxy) AddICECandidate(candidate webrtc.ICECandidateInit) error {
+func (wp *WebRTCProxy) AddICECandidate(candidate webrtc.ICECandidateInit) error {
     // Check if the PeerConnection exists
-    if this.peerConnection == nil {
+    if wp.peerConnection == nil {
         log.Println("[WEBRTC] - PeerConnection is null.")
         return errors.New("PeerConnection is null")
     }
     
     // Try to add the ICE candidate to the PeerConnection
-    if err := this.peerConnection.AddICECandidate(candidate); err != nil {
+    if err := wp.peerConnection.AddICECandidate(candidate); err != nil {
         log.Printf("[WEBRTC] - Error while adding ICE candidate: %v", err)
         return err
     }
@@ -191,37 +228,37 @@ func (this *WebRTCProxy) AddICECandidate(candidate webrtc.ICECandidateInit) erro
 // If the PeerConnection does not exist, the method creates a new PeerConnection and sets the remote description.
 // Then, it creates an answer and sets the local description.
 // The method returns the answer to the caller.
-func (this *WebRTCProxy) HandleOffer(from string, offer webrtc.SessionDescription) (*webrtc.SessionDescription, error) {
-    if this.peerConnection != nil {
+func (wp *WebRTCProxy) HandleOffer(from string, offer webrtc.SessionDescription) (*webrtc.SessionDescription, error) {
+    if wp.peerConnection != nil {
         log.Println("[WEBRTC] - PeerConnection already exists.")
         return nil, errors.New("PeerConnection already exists.")
     }
 
-    if err := this.CreatePeerConnection(from); err != nil {
+    if err := wp.CreatePeerConnection(from); err != nil {
         return nil, err
     }
     log.Println("[WEBRTC] - PeerConnection OK")
 
-    if err := this.peerConnection.SetRemoteDescription(offer); err != nil {
+    if err := wp.peerConnection.SetRemoteDescription(offer); err != nil {
         return nil, err
     }
     log.Println("[WEBRTC] - SetRemoteDescription OK")
 
-    answer, err := this.peerConnection.CreateAnswer(nil)
+    answer, err := wp.peerConnection.CreateAnswer(nil)
     if err != nil {
         log.Printf("[WEBRTC] - Error while creating answer: %v", err)
         return nil, err
     }
     log.Println("[WEBRTC] - CreateAnswer OK")
 
-    if err := this.peerConnection.SetLocalDescription(answer); err != nil {
+    if err := wp.peerConnection.SetLocalDescription(answer); err != nil {
         log.Printf("[WEBRTC] - Error while setting local description: %v", err)
-        this.Close()
+        wp.Close()
         return nil, err
     }
     log.Println("[WEBRTC] - SetLocalDescription OK")
 
-    return this.peerConnection.CurrentLocalDescription(), nil
+    return wp.peerConnection.CurrentLocalDescription(), nil
 }
 
 
@@ -232,17 +269,17 @@ func (this *WebRTCProxy) HandleOffer(from string, offer webrtc.SessionDescriptio
 // The isVideo parameter indicates if the packet is a video or audio packet.
 //
 // The method returns an error if the packet cannot be sent.
-func (this *WebRTCProxy) sendPacket(payload []byte, timestamp uint32, isVideo bool) error {
+func (wp *WebRTCProxy) sendPacket(payload []byte, timestamp uint32, isVideo bool) error {
     // If the packet is a video packet and the video track is not nil, write the packet to the track.
-    if isVideo && this.videoTrack != nil {
-        return this.videoTrack.WriteSample(media.Sample{
+    if isVideo && wp.videoTrack != nil {
+        return wp.videoTrack.WriteSample(media.Sample{
             Data:     payload,
             Duration: time.Millisecond * time.Duration(timestamp),
         })
     }
     // If the packet is an audio packet and the audio track is not nil, write the packet to the track.
-    if !isVideo && this.audioTrack != nil {
-        return this.audioTrack.WriteSample(media.Sample{
+    if !isVideo && wp.audioTrack != nil {
+        return wp.audioTrack.WriteSample(media.Sample{
             Data:     payload,
             Duration: time.Millisecond * time.Duration(timestamp),
         })
@@ -253,39 +290,65 @@ func (this *WebRTCProxy) sendPacket(payload []byte, timestamp uint32, isVideo bo
 
 // StartRTSPStream starts the RTSP stream.
 //
-// This method is used to start the RTSP stream and handle the incoming packets.
-func (this *WebRTCProxy) StartRTSPStream() {
-	log.Printf("[RTSP] - Connecting to RTSP %s...", this.rtspUrl)
+// wp method is used to start the RTSP stream and handle the incoming packets.
+func (wp *WebRTCProxy) StartRTSPStream() {
+	log.Printf("[RTSP] - Connecting to RTSP %s...", wp.rtspUrl)
     
-    this.rtspClient = NewRtspClient()
-	this.demuxer.reset()
+    wp.rtspClient = NewRtspClient()
+	wp.annexBParser.reset()
 
-	if err := this.rtspClient.Client(this.rtspUrl, false); err == nil {
+	if err := wp.rtspClient.Client(wp.rtspUrl, false); err == nil {
 		log.Println("[RTSP] - Connected")
+		
+		// Counters to reduce log frequency
+		packetCount := 0
+		lastLogTime := time.Now()
+		noPayloadCount := 0
+		
 		for {
 			select {
-			case data := <- this.rtspClient.received:
+			case data := <- wp.rtspClient.received:
 				if len(data) > 12 {
-					//log.Printf("[RTSP] - packet [0]=%x type=%d - %d\n", data[0], data[1], len(data)) //
-						payload, duration := this.demuxer.handlePacket(&data)
-						if payload != nil {
-							this.sendPacket(payload, duration, data[1] == 0 )
-						} else {
-                            log.Println("[RTSP] - no payload")
-                        }					
-
-				} else {
-					log.Println("[RTSP] - Data too short to contain an RTP header")
+					// Process the packet
+					payload, duration := wp.annexBParser.handlePacket(&data)
+					
+					if payload != nil {
+						// Send the packet to the WebRTC client
+						if err := wp.sendPacket(payload, duration, data[1] == 0); err != nil {
+							// Log only in case of error
+							log.Printf("[RTSP] - Error sending packet: %v", err)
+						}
+						
+						// Increment packet counter
+						packetCount++
+						
+						// Periodic logging (every 5 seconds) to reduce CPU usage
+						if time.Since(lastLogTime) > 5*time.Second {
+							log.Printf("[RTSP] - Processed %d packets in last 5 seconds", packetCount)
+							packetCount = 0
+							lastLogTime = time.Now()
+							
+							// Reset the counter for packets without payload
+							if noPayloadCount > 0 {
+								log.Printf("[RTSP] - %d packets had no payload", noPayloadCount)
+								noPayloadCount = 0
+							}
+						}
+					} else {
+						// Count packets without payload instead of logging them individually
+						noPayloadCount++
+					}
+				} else if len(data) > 0 {
+					// Less frequent logging for packets that are too short
+					log.Println("[RTSP] - Packet too short to contain an RTP header")
 				}
-			case <-this.rtspClient.signals:
-				log.Println("[RTSP] - exit signal by class rtsp")
+			case <-wp.rtspClient.signals:
+				log.Println("[RTSP] - Exit signal received from RTSP client")
+				return
 			}
 		}
-		log.Println("[RTSP] - exit ")
 	} else {
-		log.Println("[RTSP] - ", err)
-        this.Close()
+		log.Printf("[RTSP] - Connection error: %v", err)
+        wp.Close()
 	}
 }
-
-

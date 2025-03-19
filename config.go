@@ -7,19 +7,23 @@ import (
     "crypto/md5"
 	"encoding/hex"
 )
+type Device struct {        
+    URL string `yaml:"url"`
+    ID string
+    Audio string `yaml:"audio"`
+    Video string `yaml:"video"`
+}
+
+type MQTT struct {
+    URL      string `yaml:"url"`
+    Username string `yaml:"username"`
+    Password string `yaml:"password"`
+    Name string `yaml:"name"`
+}
 
 type Config struct {    
-    MQTT struct {
-        URL      string `yaml:"url"`
-        Username string `yaml:"username"`
-        Password string `yaml:"password"`
-        Name string `yaml:"name"`
-
-    } `yaml:"mqtt"`
-    Device struct {        
-        URL string `yaml:"url"`
-        ID string
-    } `yaml:"device"`
+    MQTT MQTT `yaml:"mqtt"`
+    Device Device `yaml:"device"`
 }
 
 func loadConfig(filename string) (*Config, error) {
