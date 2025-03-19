@@ -45,53 +45,53 @@ func NewRtspClient() *RtspClient {
 }
 
 // main function for working with RTSP
-func (this *RtspClient) Client(rtsp_url string, udp bool) error {
+func (rc *RtspClient) Client(rtsp_url string, udp bool) error {
 	// check and parse URL
-	if !this.ParseUrl(rtsp_url) {
+	if !rc.ParseUrl(rtsp_url) {
 		return errors.New( "Invalid URL")
 	}
 
-	this.udp = udp
+	rc.udp = udp
 	// establish connection to the camera
-	if !this.Connect() {
+	if !rc.Connect() {
 		return errors.New( "Unable to connect")
 	}
 	// phase 1 OPTIONS - first stage of communication with the camera
 	// send OPTIONS request and read response to the OPTIONS request
-	if status, _, _ := this.SendRequest("OPTIONS", this.uri, nil); status != 200 {
-		this.SendRequest("OPTIONS", this.uri, nil)
+	if status, _, _ := rc.SendRequest("OPTIONS", rc.uri, nil); status != 200 {
+		rc.SendRequest("OPTIONS", rc.uri, nil)
 	}
 	
 
 	// PHASE 2 DESCRIBE		
-	if status, message, err := this.SendRequest("DESCRIBE", this.uri, nil); err != nil {
+	if status, message, err := rc.SendRequest("DESCRIBE", rc.uri, nil); err != nil {
 		return errors.New(  "Unable to read DESCRIBE response; connection lost?")
 	} else if status != 200 {
 		return errors.New(  "DESCRIBE error; not status code 200 OK " + message)
 	} else {		
-		this.track = this.ParseMedia(message)
+		rc.track = rc.ParseMedia(message)
 	}
-	if len(this.track) == 0 {
+	if len(rc.track) == 0 {
 		return errors.New( "Error; track not found")
 	}
 
 	// PHASE 3 SETUP
 
-	if this.udp {
+	if rc.udp {
 		//var err error
 		tmp, err := net.ListenPacket("udp4", "0.0.0.0:26968")
 		if err != nil {
 			panic(err)
 		}
-		this.rtpConn = tmp.(*net.UDPConn)
-		log.Printf("udp listenning on address %s", this.rtpConn.LocalAddr().String())
+		rc.rtpConn = tmp.(*net.UDPConn)
+		log.Printf("udp listenning on address %s", rc.rtpConn.LocalAddr().String())
 		
-		err = this.rtpConn.SetReadBuffer(0x80000)
+		err = rc.rtpConn.SetReadBuffer(0x80000)
 		if err != nil {
 			panic(err)
 		}
-		this.rtpConn.SetReadDeadline(time.Time{})
-		// this.rtcpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 26969})
+		rc.rtpConn.SetReadDeadline(time.Time{})
+		// rc.rtcpConn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 26969})
 		// if err != nil {
 		// 	panic(err)
 		// }
@@ -100,37 +100,37 @@ func (this *RtspClient) Client(rtsp_url string, udp bool) error {
 
 
 	transport := "RTP/AVP/TCP;unicast;interleaved=0-1"
-	if(this.udp){
+	if(rc.udp){
 		transport = "RTP/AVP;unicast;client_port=26968-26969"
 	}
 	
-	if status, message, err := this.SendRequest("SETUP", this.uri + "/" + this.track[0], map[string]string{"Transport": transport}); err != nil {
+	if status, message, err := rc.SendRequest("SETUP", rc.uri + "/" + rc.track[0], map[string]string{"Transport": transport}); err != nil {
 		return errors.New( "Unable to read SETUP response; connection lost")
 	} else if status == 200 {
-			this.session = ParseSession(message)
-			log.Printf("Session : %s", this.session)			
+			rc.session = ParseSession(message)
+			log.Printf("Session : %s", rc.session)			
 	}
 	
-	if len(this.track) > 1 {
+	if len(rc.track) > 1 {
 		transport := "RTP/AVP/TCP;unicast;interleaved=2-3"
-		if(this.udp){
+		if(rc.udp){
 			transport = "RTP/AVP;unicast;client_port=5002-5003"
 		}
 
-		if status, message, err := this.SendRequest("SETUP", this.uri + "/" + this.track[1], map[string]string{"Transport": transport}); err != nil {
+		if status, message, err := rc.SendRequest("SETUP", rc.uri + "/" + rc.track[1], map[string]string{"Transport": transport}); err != nil {
 			return errors.New(  "Unable to read SETUP response; connection lost")
 		} else if status == 200 {
-					this.session = ParseSession(message)
-					log.Printf("Session : %s", this.session)
+					rc.session = ParseSession(message)
+					log.Printf("Session : %s", rc.session)
 		}
 	}
 	
 
 	// PHASE 4 PLAY		
-	if status, _, err := this.SendRequest("PLAY", this.uri, map[string]string{"Range": "npt=0-"}); err != nil {
+	if status, _, err := rc.SendRequest("PLAY", rc.uri, map[string]string{"Range": "npt=0-"}); err != nil {
 		return errors.New( "Unable to read PLAY response; connection lost")
 	} else if status == 200 {
-		go this.RtspRtpLoop()		
+		go rc.RtspRtpLoop()		
 		return nil
 	}
 	return errors.New(  "other error")
@@ -169,9 +169,9 @@ extension (X): 1 bit
       If the extension bit is set, the fixed header MUST be followed by
       exactly one header extension.
 */
-func (this *RtspClient) RtspRtpLoop() {
+func (rc *RtspClient) RtspRtpLoop() {
 	defer func() {
-		this.signals <- true
+		rc.signals <- true
 	}()
 	header := make([]byte, 4)
 	payload := make([]byte, 1600)
@@ -179,24 +179,24 @@ func (this *RtspClient) RtspRtpLoop() {
 	timer := time.Now()
 	for {
 			if int(time.Now().Sub(timer).Seconds()) > 50 {				
-				if _, _, err := this.SendRequest("OPTIONS", this.uri, nil); err != nil {
+				if _, _, err := rc.SendRequest("OPTIONS", rc.uri, nil); err != nil {
 					return
 				}
 				timer = time.Now()
 			}
-			if this.udp {
+			if rc.udp {
 				
 				// log.Println("UDP")
-				// n, _, err := this.rtcpConn.ReadFromUDP(payload)
+				// n, _, err := rc.rtcpConn.ReadFromUDP(payload)
 				log.Println("UDP2 ")
 
-				n, _, err := this.rtpConn.ReadFrom(payload)
+				n, _, err := rc.rtpConn.ReadFrom(payload)
 				if err != nil {
 					panic(fmt.Sprintf("error during read: %s", err))
 				}
-				this.received <- payload[:n]
+				rc.received <- payload[:n]
 				// Lecture des paquets RTCP
-				n, addr, err := this.rtcpConn.ReadFrom(payload)
+				n, addr, err := rc.rtcpConn.ReadFrom(payload)
 				if err != nil {
 					log.Printf("Erreur de lecture RTCP : %v", err)
 					continue
@@ -206,9 +206,9 @@ func (this *RtspClient) RtspRtpLoop() {
 			} else {
 
 				
-				this.socket.SetDeadline(time.Now().Add(50 * time.Second))
+				rc.socket.SetDeadline(time.Now().Add(50 * time.Second))
 				// Read the 4-byte interleaved header
-				if n, err := io.ReadFull(this.socket, header); err != nil || n != 4 {
+				if n, err := io.ReadFull(rc.socket, header); err != nil || n != 4 {
 					log.Println("Failed to read interleaved header:", err)
 					return
 				}
@@ -227,7 +227,7 @@ func (this *RtspClient) RtspRtpLoop() {
 				}
 
 				// Read the actual RTP payload
-				if n, err := io.ReadFull(this.socket, payload[:payloadLen]); err != nil || n != payloadLen {
+				if n, err := io.ReadFull(rc.socket, payload[:payloadLen]); err != nil || n != payloadLen {
 					log.Println("Error reading RTP payload:", err)
 					return
 				}
@@ -236,47 +236,47 @@ func (this *RtspClient) RtspRtpLoop() {
     			
 				// Send the complete RTP packet (header + payload) to the received channel
 				rtpPacket := append(header, payload[:payloadLen]...)
-				this.received <- rtpPacket
+				rc.received <- rtpPacket
 		}
 	}
 }
 
 
-func (this *RtspClient) Connect() bool {
+func (rc *RtspClient) Connect() bool {
 	d := &net.Dialer{Timeout: 3 * time.Second}
-	conn, err := d.Dial("tcp", this.host+":"+this.port)
+	conn, err := d.Dial("tcp", rc.host+":"+rc.port)
 	if err != nil {
 		return false
 	}
-	this.socket = conn
+	rc.socket = conn
 	return true
 }
 
 
-func (this *RtspClient) SendRequest(requestType string, uri string, content map[string]string) (int, string, error) {
-	this.cseq += 1
-	message := requestType + " " + uri + " RTSP/1.0\r\nUser-Agent: rtsp-client\r\nAccept: application/sdp\r\nCSeq: " + strconv.Itoa(this.cseq) + "\r\n"
-	if this.auth != "" {
-		message += this.auth + "\r\n"
+func (rc *RtspClient) SendRequest(requestType string, uri string, content map[string]string) (int, string, error) {
+	rc.cseq += 1
+	message := requestType + " " + uri + " RTSP/1.0\r\nUser-Agent: rtsp-client\r\nAccept: application/sdp\r\nCSeq: " + strconv.Itoa(rc.cseq) + "\r\n"
+	if rc.auth != "" {
+		message += rc.auth + "\r\n"
 	}
 	for k, v := range content {
 		message += k + ": " + v + "\r\n"
 	}
 
-	if this.session != "" {
-		message += "Session: " + this.session + "\r\n"
+	if rc.session != "" {
+		message += "Session: " + rc.session + "\r\n"
 	}
 
 
 	log.Println("***** SENDING *****")
 	log.Println(message)
-	if _, e := this.socket.Write([]byte(message + "\r\n")); e != nil {
+	if _, e := rc.socket.Write([]byte(message + "\r\n")); e != nil {
 		log.Println("socket write failed", e)
 		return 0, "", e
 	}	
 	
 	buffer := make([]byte, 4096)
-	if nb, err := this.socket.Read(buffer); err != nil || nb <= 0 {
+	if nb, err := rc.socket.Read(buffer); err != nil || nb <= 0 {
 		log.Println("socket read failed", err)
 		return 0, "", err
 	} else {
@@ -285,28 +285,23 @@ func (this *RtspClient) SendRequest(requestType string, uri string, content map[
 		log.Println(result)
 
 		// check authentication method if not set 
-		if this.auth == "" {
+		if rc.auth == "" {
 			if strings.Contains(result, "Digest") {
 				nonce := ParseDirective(result, "nonce")
 				realm := ParseDirective(result, "realm")
-				hs1 := GetMD5Hash(this.login + ":" + realm + ":" + this.password)
-				hs2 := GetMD5Hash(requestType + ":" + this.uri)
+				hs1 := GetMD5Hash(rc.login + ":" + realm + ":" + rc.password)
+				hs2 := GetMD5Hash(requestType + ":" + rc.uri)
 				response := GetMD5Hash(hs1 + ":" + nonce + ":" + hs2)
-				this.auth = `Authorization: Digest username="` + this.login + `", realm="` + realm + `", nonce="` + nonce + `", uri="` + this.uri + `", response="` + response + `"`
+				rc.auth = `Authorization: Digest username="` + rc.login + `", realm="` + realm + `", nonce="` + nonce + `", uri="` + rc.uri + `", response="` + response + `"`
 	
 			} else if strings.Contains(result, "Basic") {
-				this.auth = "\r\nAuthorization: Basic " + b64.StdEncoding.EncodeToString([]byte(this.login+":"+this.password))	
+				rc.auth = "\r\nAuthorization: Basic " + b64.StdEncoding.EncodeToString([]byte(rc.login+":"+rc.password))	
 			}
-
 			// resend request 
-
 		}
 
 		// extract status code : RTSP/1.0 200 OK convert to int
 		statusCode, _ := strconv.Atoi(result[9:9+3])
-
-
-
 
 		return statusCode, result, nil
 	}
@@ -316,35 +311,35 @@ func (this *RtspClient) SendRequest(requestType string, uri string, content map[
 
 }
 
-func (this *RtspClient) ParseUrl(rtsp_url string) bool {
+func (rc *RtspClient) ParseUrl(rtsp_url string) bool {
 	u, err := url.Parse(rtsp_url)
 	if err != nil {
 		return false
 	}
 	phost := strings.Split(u.Host, ":")
-	this.host = phost[0]
+	rc.host = phost[0]
 	if len(phost) == 2 {
-		this.port = phost[1]
+		rc.port = phost[1]
 	} else {
-		this.port = "554"
+		rc.port = "554"
 	}
-	this.login = u.User.Username()
-	this.password, _ = u.User.Password()
-	log.Printf("host: %s, port: %s, login: %s, password: %s", this.host, this.port, this.login, this.password)
-	this.uri = "rtsp://" + this.host + ":" + this.port + u.Path
+	rc.login = u.User.Username()
+	rc.password, _ = u.User.Password()
+	log.Printf("host: %s, port: %s, login: %s, password: %s", rc.host, rc.port, rc.login, rc.password)
+	rc.uri = "rtsp://" + rc.host + ":" + rc.port + u.Path
 	if u.RawQuery != "" {
-		this.uri += "?" + string(u.RawQuery)
+		rc.uri += "?" + string(u.RawQuery)
 	} 
 	return true
 }
 
-func (this *RtspClient) Close() {
-	if this.socket != nil {
-		this.socket.Close()
+func (rc *RtspClient) Close() {
+	if rc.socket != nil {
+		rc.socket.Close()
 	}
 
-	if this.rtpConn != nil {
-		this.rtpConn.Close()
+	if rc.rtpConn != nil {
+		rc.rtpConn.Close()
 	}
 }
 
@@ -379,7 +374,7 @@ func GetMD5Hash(text string) string {
 	hash := md5.Sum([]byte(text))
 	return hex.EncodeToString(hash[:])
 }
-func (this *RtspClient) ParseMedia(header string) []string {
+func (rc *RtspClient) ParseMedia(header string) []string {
 	letters := []string{}
 	mparsed := strings.Split(header, "\r\n")
 	paste := ""
@@ -405,8 +400,8 @@ func (this *RtspClient) ParseMedia(header string) []string {
 				dims = append(dims, v)
 			}
 			if len(dims) == 2 {
-				this.videow = dims[0]
-				this.videoh = dims[1]
+				rc.videow = dims[0]
+				rc.videoh = dims[1]
 			}
 		}
 	}
