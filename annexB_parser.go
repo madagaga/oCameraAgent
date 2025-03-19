@@ -131,7 +131,7 @@ func (this *AnnexBParser) handlePacket(data *[]byte) ([]byte , uint32){
 func (this *AnnexBParser) parseNalu(data []byte, timestamp uint32) ([]byte, uint32) {
 	naluType  := data[0] & 0x1F
 
-	// Réduction des logs pour diminuer la charge CPU - seulement pour les types importants
+	// Reduce logging to decrease CPU usage - only for important types
 	if naluType == 5 || naluType == NALU_SPS || naluType == NALU_PPS {
 		log.Printf("[H264] - nal type : %d - ts : %d", naluType, timestamp)
 	}
@@ -200,23 +200,23 @@ func (this *AnnexBParser) handleNALU(naluType byte, payload []byte, ts uint32) (
     // Calculate the duration since the last packet was processed
     duration := ts - this.videoTS
     
-    // Réduction des logs pour diminuer la charge CPU
+    // Reduce logging to decrease CPU usage
     if duration > 5000 {
         log.Printf("[H264] - duration : %d", duration)
     }
 
     // Check if the NAL unit type is a keyframe
     if naluType == 5 {
-        // Log moins fréquent
+        // Less frequent logging
         if duration > 5000 {
             log.Println("[H264] - keyframe")
         }
         
-        // Optimisation: préallocation du buffer pour éviter les multiples append coûteux
+        // Optimization: preallocate buffer to avoid costly multiple appends
         totalSize := len(this.startCode)*3 + len(this.pps) + len(this.sps) + len(payload)
         optimizedPayload := make([]byte, 0, totalSize)
         
-        // Construction du buffer en une seule passe
+        // Build the buffer in a single pass
         optimizedPayload = append(optimizedPayload, this.startCode...)
         optimizedPayload = append(optimizedPayload, this.sps...)
         optimizedPayload = append(optimizedPayload, this.startCode...)

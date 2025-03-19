@@ -101,11 +101,11 @@ func (wp *WebRTCProxy) Close() {
 //
 // The method is called when the HandleOffer method is called and a new PeerConnection needs to be created.
 func (wp *WebRTCProxy) CreatePeerConnection(from string) error {
-    // Optimisation: Configuration WebRTC adaptative
-    // Utiliser une configuration minimale pour les réseaux locaux
-    // Les serveurs STUN ne sont nécessaires que pour traverser les NAT
+    // Optimization: Adaptive WebRTC configuration
+    // Use minimal configuration for local networks
+    // STUN servers are only necessary for NAT traversal
     
-    // Détection basique de réseau local basée sur l'adresse IP
+    // Basic local network detection based on IP address
     isLocalNetwork := strings.HasPrefix(from, "192.168.") || 
                       strings.HasPrefix(from, "10.") || 
                       strings.HasPrefix(from, "172.16.") ||
@@ -128,11 +128,11 @@ func (wp *WebRTCProxy) CreatePeerConnection(from string) error {
     var config webrtc.Configuration
     
     if isLocalNetwork {
-        // Configuration minimale pour réseau local - pas de serveurs STUN
+        // Minimal configuration for local network - no STUN servers
         log.Println("[WEBRTC] - Using local network configuration (no STUN servers)")
         config = webrtc.Configuration{}
     } else {
-        // Configuration standard avec serveurs STUN pour traverser les NAT
+        // Standard configuration with STUN servers for NAT traversal
         log.Println("[WEBRTC] - Using standard configuration with STUN servers")
         config = webrtc.Configuration{
             ICEServers: []webrtc.ICEServer{
@@ -300,7 +300,7 @@ func (wp *WebRTCProxy) StartRTSPStream() {
 	if err := wp.rtspClient.Client(wp.rtspUrl, false); err == nil {
 		log.Println("[RTSP] - Connected")
 		
-		// Compteurs pour réduire la fréquence des logs
+		// Counters to reduce log frequency
 		packetCount := 0
 		lastLogTime := time.Now()
 		noPayloadCount := 0
@@ -309,37 +309,37 @@ func (wp *WebRTCProxy) StartRTSPStream() {
 			select {
 			case data := <- wp.rtspClient.received:
 				if len(data) > 12 {
-					// Traitement du paquet
+					// Process the packet
 					payload, duration := wp.annexBParser.handlePacket(&data)
 					
 					if payload != nil {
-						// Envoyer le paquet au client WebRTC
+						// Send the packet to the WebRTC client
 						if err := wp.sendPacket(payload, duration, data[1] == 0); err != nil {
-							// Log uniquement en cas d'erreur
+							// Log only in case of error
 							log.Printf("[RTSP] - Error sending packet: %v", err)
 						}
 						
-						// Incrémenter le compteur de paquets
+						// Increment packet counter
 						packetCount++
 						
-						// Log périodique (toutes les 5 secondes) pour réduire la charge CPU
+						// Periodic logging (every 5 seconds) to reduce CPU usage
 						if time.Since(lastLogTime) > 5*time.Second {
 							log.Printf("[RTSP] - Processed %d packets in last 5 seconds", packetCount)
 							packetCount = 0
 							lastLogTime = time.Now()
 							
-							// Réinitialiser le compteur de paquets sans payload
+							// Reset the counter for packets without payload
 							if noPayloadCount > 0 {
 								log.Printf("[RTSP] - %d packets had no payload", noPayloadCount)
 								noPayloadCount = 0
 							}
 						}
 					} else {
-						// Compter les paquets sans payload au lieu de les logger individuellement
+						// Count packets without payload instead of logging them individually
 						noPayloadCount++
 					}
 				} else if len(data) > 0 {
-					// Log moins fréquent pour les paquets trop courts
+					// Less frequent logging for packets that are too short
 					log.Println("[RTSP] - Packet too short to contain an RTP header")
 				}
 			case <-wp.rtspClient.signals:
