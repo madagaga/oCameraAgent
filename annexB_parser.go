@@ -1,17 +1,16 @@
 package main
 
 import (
-    "log"
 	"bytes"
 )
 
 type AnnexBParser struct {
 	startCode []byte
-	videoTS uint32
-	audioTS uint32
-	pps []byte
-	sps []byte
-	fuBuffer *bytes.Buffer
+	videoTS   uint32
+	audioTS   uint32
+	pps       []byte
+	sps       []byte
+	fuBuffer  *bytes.Buffer
 	fuStarted bool
 }
 
@@ -35,74 +34,76 @@ func NewAnnexBParser() *AnnexBParser {
 	}
 	return Obj
 }
+
 func (this *AnnexBParser) reset() {
 	this.videoTS = 0
 	this.audioTS = 0
 	this.fuBuffer.Reset()
 	this.fuStarted = false
+	Debug("H264", "AnnexB parser reset")
 }
 
-func (this *AnnexBParser) handlePacket(data *[]byte) ([]byte , uint32){
+func (this *AnnexBParser) handlePacket(data *[]byte) ([]byte, uint32) {
 	content := *data
-	
-    if len(content) < 4 {
-        return nil, 0 // Not enough data
-    }
 
-    // Assuming RTSP interleaved data
-    channel := int(content[1])
+	if len(content) < 4 {
+		return nil, 0 // Not enough data
+	}
 
-    // The RTP packet starts at content[4:]
-    rtpPacket := content[4:]
+	// Assuming RTSP interleaved data
+	channel := int(content[1])
 
-    if len(rtpPacket) < 12 {
-        return nil, 0 // Not enough data for RTP header
-    }
+	// The RTP packet starts at content[4:]
+	rtpPacket := content[4:]
 
-    // Parse RTP header
-    firstByte := rtpPacket[0]
-    padding := (firstByte>>5)&1 == 1
-    extension := (firstByte>>4)&1 == 1
-    CSRCCnt := int(firstByte & 0x0F)
-    //secondByte := rtpPacket[1]
-    //marker := (secondByte>>7)&1 == 1
-    //payloadType := secondByte & 0x7F
+	if len(rtpPacket) < 12 {
+		return nil, 0 // Not enough data for RTP header
+	}
 
-    //sequenceNumber := (uint16(rtpPacket[2]) << 8) + uint16(rtpPacket[3])
-    timestamp := (uint32(rtpPacket[4]) << 24) + (uint32(rtpPacket[5]) << 16) + (uint32(rtpPacket[6]) << 8) + uint32(rtpPacket[7])
-    //ssrc := (uint32(rtpPacket[8]) << 24) + (uint32(rtpPacket[9]) << 16) + (uint32(rtpPacket[10]) << 8) + uint32(rtpPacket[11])
+	// Parse RTP header
+	firstByte := rtpPacket[0]
+	padding := (firstByte>>5)&1 == 1
+	extension := (firstByte>>4)&1 == 1
+	CSRCCnt := int(firstByte & 0x0F)
+	//secondByte := rtpPacket[1]
+	//marker := (secondByte>>7)&1 == 1
+	//payloadType := secondByte & 0x7F
+
+	//sequenceNumber := (uint16(rtpPacket[2]) << 8) + uint16(rtpPacket[3])
+	timestamp := (uint32(rtpPacket[4]) << 24) + (uint32(rtpPacket[5]) << 16) + (uint32(rtpPacket[6]) << 8) + uint32(rtpPacket[7])
+	//ssrc := (uint32(rtpPacket[8]) << 24) + (uint32(rtpPacket[9]) << 16) + (uint32(rtpPacket[10]) << 8) + uint32(rtpPacket[11])
 
 	offset := 12
 
-	 // Skip CSRC identifiers if present
-	 if len(rtpPacket) < offset+4*CSRCCnt {
-        return nil, 0 // Not enough data for CSRC list
-    }
-    offset += 4 * CSRCCnt
+	// Skip CSRC identifiers if present
+	if len(rtpPacket) < offset+4*CSRCCnt {
+		return nil, 0 // Not enough data for CSRC list
+	}
+	offset += 4 * CSRCCnt
 
-    // Skip extension header if present
-    if extension {
-        if len(rtpPacket) < offset+4 {
-            return nil, 0 // Not enough data for extension header
-        }
-        extHeaderLength := (uint16(rtpPacket[offset+2]) << 8) + uint16(rtpPacket[offset+3])
-        extHeaderLengthInBytes := int(extHeaderLength) * 4
-        offset += 4 // Skip extension header
-        if len(rtpPacket) < offset+extHeaderLengthInBytes {
-            return nil, 0 // Not enough data for extension payload
-        }
-        offset += extHeaderLengthInBytes
-    }
+	// Skip extension header if present
+	if extension {
+		if len(rtpPacket) < offset+4 {
+			return nil, 0 // Not enough data for extension header
+		}
+		extHeaderLength := (uint16(rtpPacket[offset+2]) << 8) + uint16(rtpPacket[offset+3])
+		extHeaderLengthInBytes := int(extHeaderLength) * 4
+		offset += 4 // Skip extension header
+		if len(rtpPacket) < offset+extHeaderLengthInBytes {
+			return nil, 0 // Not enough data for extension payload
+		}
+		offset += extHeaderLengthInBytes
+	}
 
-    // Adjust for padding
-    end := len(rtpPacket)
-    if padding {
-        paddingLength := int(rtpPacket[end-1])
-        if paddingLength > len(rtpPacket)-offset {
-            return nil, 0 // Invalid padding length
-        }
-        end -= paddingLength
-    }
+	// Adjust for padding
+	end := len(rtpPacket)
+	if padding {
+		paddingLength := int(rtpPacket[end-1])
+		if paddingLength > len(rtpPacket)-offset {
+			return nil, 0 // Invalid padding length
+		}
+		end -= paddingLength
+	}
 
 	switch channel {
 	case 0:
@@ -116,123 +117,143 @@ func (this *AnnexBParser) handlePacket(data *[]byte) ([]byte , uint32){
 		// Check if this is the first packet, if so, initialize previous timestamp
 		if this.audioTS == 0 {
 			// Set a default offset for the previous timestamp to avoid initial zero value
-			this.audioTS = timestamp			
+			this.audioTS = timestamp
 		}
-		
-		duration := timestamp - this.audioTS		
+		if end <= offset {
+			return nil, 0
+		}
+
+		duration := timestamp - this.audioTS
 		this.audioTS = timestamp
-		return rtpPacket[offset:end],duration		
+		return rtpPacket[offset:end], duration
 	}
 
 	return nil, 0
-	
 }
 
 func (this *AnnexBParser) parseNalu(data []byte, timestamp uint32) ([]byte, uint32) {
-	naluType  := data[0] & 0x1F
+	if len(data) == 0 {
+		return nil, 0
+	}
+
+	naluType := data[0] & 0x1F
 
 	// Reduce logging to decrease CPU usage - only for important types
 	if naluType == 5 || naluType == NALU_SPS || naluType == NALU_PPS {
-		log.Printf("[H264] - nal type : %d - ts : %d", naluType, timestamp)
+		Debug("H264", "NAL type: %d - timestamp: %d", naluType, timestamp)
 	}
-	switch {
-	case naluType  >= 1 && naluType  <= 5:
-		return this.handleNALU(naluType , data, timestamp)
-	case naluType  == NALU_SPS:
-		this.updateSPS(data)
-	case naluType  == NALU_PPS:
-		this.updatePPS(data)
-	case naluType  == 24:
-		log.Printf("[H264] - 24")
 
-	case naluType  == 28:
-		fuIndicator := data[0]		
+	switch {
+	case naluType >= 1 && naluType <= 5:
+		return this.handleNALU(naluType, data, timestamp)
+	case naluType == NALU_SPS:
+		this.updateSPS(data)
+	case naluType == NALU_PPS:
+		this.updatePPS(data)
+	case naluType == 24:
+		Debug("H264", "STAP-A packet received")
+
+	case naluType == 28:
+		if len(data) < 2 {
+			Debug("H264", "Invalid FU-A packet: missing FU header")
+			return nil, 0
+		}
+
+		fuIndicator := data[0]
 		fuHeader := data[1]
 		isStart := fuHeader&0x80 != 0
-		isEnd := fuHeader&0x40 != 0        
-		
-		 //nri := (data[headerIndexr+1]&0x60)>>5
-		 
-		 //log.Printf("[H264] - nal type : %d - isStart : %t - isEnd : %t", naluType , isStart, isEnd)
+		isEnd := fuHeader&0x40 != 0
 
-		 if isStart {			 
-			 this.fuBuffer.Reset()
-			 this.fuBuffer.WriteByte(fuIndicator&0xe0 | fuHeader&0x1f)
-			 this.fuStarted = true
-		 }
-		 if this.fuStarted {
+		//nri := (data[headerIndexr+1]&0x60)>>5
+
+		//Debug("H264", "FU-A packet - isStart: %t - isEnd: %t", isStart, isEnd)
+
+		if isStart {
+			this.fuBuffer.Reset()
+			this.fuBuffer.WriteByte(fuIndicator&0xe0 | fuHeader&0x1f)
+			this.fuStarted = true
+		}
+
+		if this.fuStarted {
+			if len(data) < 3 {
+				Debug("H264", "Invalid FU-A packet: missing FU payload")
+				return nil, 0
+			}
 			this.fuBuffer.Write(data[2:])
-		 
-		 
+
 			if isEnd {
 				this.fuStarted = false
-				// // packet may contain multiple NAL units
-				subNaluType := this.fuBuffer.Bytes()[0] & 0x1F
-				//log.Printf("[H264] - SUB nal type : %d - ts : %d", subNaluType, timestamp)
+				// packet may contain multiple NAL units
+				bufferedBytes := this.fuBuffer.Bytes()
+				if len(bufferedBytes) == 0 {
+					return nil, 0
+				}
+				subNaluType := bufferedBytes[0] & 0x1F
+				//Debug("H264", "SUB NAL type: %d - timestamp: %d", subNaluType, timestamp)
+
 				if subNaluType == NALU_SPS || subNaluType == NALU_AUD {
 					bufered, _ := this.splitNALUs(append(this.startCode, this.fuBuffer.Bytes()...))
-					//log.Printf("Buffered count : %d", len(bufered))
+					//Debug("H264", "Buffered count: %d", len(bufered))
+
 					for _, v := range bufered {
 						subNaluType = v[0] & 0x1F
-						log.Printf("[H264] - v nal type : %d - ts : %d", subNaluType, timestamp)
+						Debug("H264", "Fragmented NAL type: %d - timestamp: %d", subNaluType, timestamp)
+
 						switch subNaluType {
 						case NALU_SPS:
 							this.updateSPS(v)
 						case NALU_PPS:
 							this.updatePPS(v)
-							case 5:
-								this.fuBuffer.Reset()
-								this.fuBuffer.Write(v)								
+						case 5:
+							this.fuBuffer.Reset()
+							this.fuBuffer.Write(v)
 						}
-						
 					}
 				}
 
 				return this.handleNALU(subNaluType, this.fuBuffer.Bytes(), timestamp)
 			}
 		}
-		
 	}
+
 	return nil, 0
 }
 
 func (this *AnnexBParser) handleNALU(naluType byte, payload []byte, ts uint32) ([]byte, uint32) {
-    // Calculate the duration since the last packet was processed
-    duration := ts - this.videoTS
-    
-    // Reduce logging to decrease CPU usage
-    if duration > 5000 {
-        log.Printf("[H264] - duration : %d", duration)
-    }
+	// Calculate the duration since the last packet was processed
+	duration := ts - this.videoTS
 
-    // Check if the NAL unit type is a keyframe
-    if naluType == 5 {
-        // Less frequent logging
-        if duration > 5000 {
-            log.Println("[H264] - keyframe")
-        }
-        
-        // Optimization: preallocate buffer to avoid costly multiple appends
-        totalSize := len(this.startCode)*3 + len(this.pps) + len(this.sps) + len(payload)
-        optimizedPayload := make([]byte, 0, totalSize)
-        
-        // Build the buffer in a single pass
-        optimizedPayload = append(optimizedPayload, this.startCode...)
-        optimizedPayload = append(optimizedPayload, this.sps...)
-        optimizedPayload = append(optimizedPayload, this.startCode...)
-        optimizedPayload = append(optimizedPayload, this.pps...)
-        optimizedPayload = append(optimizedPayload, this.startCode...)
-        optimizedPayload = append(optimizedPayload, payload...)
-        
-        payload = optimizedPayload
-    } 
+	// Reduce logging to decrease CPU usage
+	if duration > 5000 {
+		Debug("H264", "Long duration between frames: %d ms", duration)
+	}
 
-    // Update previous timestamp to current timestamp
-    this.videoTS = ts
-    return payload, duration
+	// Check if the NAL unit type is a keyframe
+	if naluType == 5 {
+		// Less frequent logging
+		if duration > 5000 {
+			Info("H264", "Keyframe received")
+		}
+
+		// Optimization: preallocate buffer to avoid costly multiple appends
+		totalSize := len(this.startCode)*3 + len(this.pps) + len(this.sps) + len(payload)
+		optimizedPayload := make([]byte, 0, totalSize)
+
+		// Build the buffer in a single pass
+		optimizedPayload = append(optimizedPayload, this.startCode...)
+		optimizedPayload = append(optimizedPayload, this.sps...)
+		optimizedPayload = append(optimizedPayload, this.startCode...)
+		optimizedPayload = append(optimizedPayload, this.pps...)
+		optimizedPayload = append(optimizedPayload, this.startCode...)
+		optimizedPayload = append(optimizedPayload, payload...)
+
+		payload = optimizedPayload
+	}
+
+	// Update previous timestamp to current timestamp
+	this.videoTS = ts
+	return payload, duration
 }
-
-
 
 func (this *AnnexBParser) splitNALUs(b []byte) (nalus [][]byte, typ int) {
 	// Check if there's enough data to do anything meaningful
@@ -317,15 +338,17 @@ func (this *AnnexBParser) U32BE(b []byte) uint32 {
 }
 
 func (this *AnnexBParser) updatePPS(b []byte) {
-	if(len(this.pps) == 0) {
-	this.pps = b
-	log.Printf("[H264] - pps: %v" ,this.pps)
+	if len(this.pps) == 0 {
+		this.pps = b
+		Info("H264", "PPS updated (length: %d bytes)", len(this.pps))
+		Debug("H264", "PPS data: %v", this.pps)
 	}
 }
 
 func (this *AnnexBParser) updateSPS(b []byte) {
-	if(len(this.sps) == 0) {
-	this.sps = b
-	log.Printf("[H264] - sps: %v" ,this.sps)
+	if len(this.sps) == 0 {
+		this.sps = b
+		Info("H264", "SPS updated (length: %d bytes)", len(this.sps))
+		Debug("H264", "SPS data: %v", this.sps)
 	}
 }

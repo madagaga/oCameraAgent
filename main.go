@@ -1,7 +1,6 @@
 package main
 
 import (
-    "log"
     "os"
     "os/signal"
     "syscall"
@@ -10,13 +9,17 @@ import (
 )
 
 func main() {
-    
-
-    configFile := flag.String("config","config.yaml", "config file path")
+    configFile := flag.String("config", "config.yaml", "config file path")
+    debug := flag.Bool("debug", false, "enable debug logging")
     flag.Parse()
+    
+    // Initialize logger
+    InitLogger(*debug)
+    Info("MAIN", "Starting RTSP-WebRTC proxy...")
+
     config, err := loadConfig(*configFile)
     if err != nil {
-        log.Fatalf("Error while loading config: %v", err)
+        Fatal("MAIN", "Error while loading config: %v", err)
     }
 
     // build proxy client
@@ -26,16 +29,14 @@ func main() {
     mqttClient := NewMqttClient(config.Device.ID, config.MQTT.Username, config.MQTT.Password, config.MQTT.URL)
     mqttClient.Name = config.MQTT.Name
     mqttClient.OnOfferReceived(func(source string, offer webrtc.SessionDescription) {
-        answer, err :=webrtcProxy.HandleOffer(source, offer)
+        answer, err := webrtcProxy.HandleOffer(source, offer)
         if err != nil {
-            log.Printf("[MQTT] - Error while handling SDP: %v", err) 
+            Error("MQTT", "Error while handling SDP: %v", err) 
             mqttClient.SendError(source, err)
             mqttClient.Hangup(source)
         } else {
             mqttClient.SendAnswerSDP(source, answer)
         }
-
-
     })
 
     mqttClient.OnRemoteICECandidateReceived(func(source string, ice webrtc.ICECandidateInit) {
@@ -55,13 +56,11 @@ func main() {
         mqttClient.PublishDeviceInfo()
     })
     
-    
     c := make(chan os.Signal, 1)
     signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
     <-c
 
-    
-    log.Println("Closing app ...")
+    Info("MAIN", "Closing app...")
     webrtcProxy.Close()
     mqttClient.Close()
 }
