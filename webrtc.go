@@ -315,6 +315,8 @@ func (wp *WebRTCProxy) StartRTSPStream() {
 					// Keep short-packet logs in debug mode to avoid noisy normal runtime.
 					Debug("RTSP", "Packet too short to contain an RTP header")
 				}
+				// Return packet buffer to pool when it originates from RtspClient.
+				rtpPacketPool.Put(data[:0])
 			case <-wp.rtspClient.signals:
 				Info("RTSP", "Exit signal received from RTSP client")
 				return

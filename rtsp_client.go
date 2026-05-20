@@ -19,6 +19,7 @@ import (
 type RtspClient struct {
 	socket   net.Conn
 	reader   *bufio.Reader
+	ioMu     sync.Mutex
 	received chan []byte //out chanel
 	signals  chan bool   //signals quit
 	host     string      //host
@@ -307,6 +308,13 @@ var requestBufferPool = sync.Pool{
 }
 
 func (rc *RtspClient) SendRequest(requestType string, uri string, content map[string]string) (int, string, error) {
+	rc.ioMu.Lock()
+	defer rc.ioMu.Unlock()
+
+	if rc.socket == nil {
+		return 0, "", errors.New("socket is not initialized")
+	}
+
 	rc.cseq += 1
 
 	// Get a buffer from the pool to build the request
@@ -511,6 +519,9 @@ func (rc *RtspClient) ParseUrl(rtsp_url string) bool {
 }
 
 func (rc *RtspClient) Close() {
+	rc.ioMu.Lock()
+	defer rc.ioMu.Unlock()
+
 	// Properly close the RTSP connection
 	if rc.socket != nil {
 		// Send TEARDOWN to inform the RTSP server

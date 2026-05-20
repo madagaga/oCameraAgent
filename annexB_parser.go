@@ -5,13 +5,17 @@ import (
 )
 
 type AnnexBParser struct {
-	startCode []byte
-	videoTS   uint32
-	audioTS   uint32
-	pps       []byte
-	sps       []byte
-	fuBuffer  *bytes.Buffer
-	fuStarted bool
+	startCode   []byte
+	videoTS     uint32
+	audioTS     uint32
+	videoSeq    uint16
+	audioSeq    uint16
+	hasVideoSeq bool
+	hasAudioSeq bool
+	pps         []byte
+	sps         []byte
+	fuBuffer    *bytes.Buffer
+	fuStarted   bool
 }
 
 const (
@@ -38,6 +42,10 @@ func NewAnnexBParser() *AnnexBParser {
 func (this *AnnexBParser) reset() {
 	this.videoTS = 0
 	this.audioTS = 0
+	this.videoSeq = 0
+	this.audioSeq = 0
+	this.hasVideoSeq = false
+	this.hasAudioSeq = false
 	this.fuBuffer.Reset()
 	this.fuStarted = false
 	Debug("H264", "AnnexB parser reset")
@@ -69,7 +77,7 @@ func (this *AnnexBParser) handlePacket(data *[]byte) ([]byte, uint32) {
 	//marker := (secondByte>>7)&1 == 1
 	//payloadType := secondByte & 0x7F
 
-	//sequenceNumber := (uint16(rtpPacket[2]) << 8) + uint16(rtpPacket[3])
+	sequenceNumber := (uint16(rtpPacket[2]) << 8) + uint16(rtpPacket[3])
 	timestamp := (uint32(rtpPacket[4]) << 24) + (uint32(rtpPacket[5]) << 16) + (uint32(rtpPacket[6]) << 8) + uint32(rtpPacket[7])
 	//ssrc := (uint32(rtpPacket[8]) << 24) + (uint32(rtpPacket[9]) << 16) + (uint32(rtpPacket[10]) << 8) + uint32(rtpPacket[11])
 
@@ -107,6 +115,11 @@ func (this *AnnexBParser) handlePacket(data *[]byte) ([]byte, uint32) {
 
 	switch channel {
 	case 0:
+		if this.detectSequenceGap(0, sequenceNumber) {
+			// Drop any in-progress FU-A if we detected RTP loss on the video channel.
+			this.fuStarted = false
+			this.fuBuffer.Reset()
+		}
 		// Check if this is the first packet, if so, initialize previous timestamp
 		if this.videoTS == 0 {
 			// Set a default offset for the previous timestamp to avoid initial zero value
@@ -114,6 +127,7 @@ func (this *AnnexBParser) handlePacket(data *[]byte) ([]byte, uint32) {
 		}
 		return this.parseNalu(rtpPacket[offset:end], timestamp)
 	case 2:
+		this.detectSequenceGap(2, sequenceNumber)
 		// Check if this is the first packet, if so, initialize previous timestamp
 		if this.audioTS == 0 {
 			// Set a default offset for the previous timestamp to avoid initial zero value
@@ -151,7 +165,7 @@ func (this *AnnexBParser) parseNalu(data []byte, timestamp uint32) ([]byte, uint
 	case naluType == NALU_PPS:
 		this.updatePPS(data)
 	case naluType == 24:
-		Debug("H264", "STAP-A packet received")
+		return this.handleSTAPA(data, timestamp)
 
 	case naluType == 28:
 		if len(data) < 2 {
@@ -172,11 +186,16 @@ func (this *AnnexBParser) parseNalu(data []byte, timestamp uint32) ([]byte, uint
 			this.fuBuffer.Reset()
 			this.fuBuffer.WriteByte(fuIndicator&0xe0 | fuHeader&0x1f)
 			this.fuStarted = true
+		} else if !this.fuStarted {
+			// We got a middle/end fragment without start; likely packet loss.
+			return nil, 0
 		}
 
 		if this.fuStarted {
 			if len(data) < 3 {
 				Debug("H264", "Invalid FU-A packet: missing FU payload")
+				this.fuStarted = false
+				this.fuBuffer.Reset()
 				return nil, 0
 			}
 			this.fuBuffer.Write(data[2:])
@@ -236,6 +255,12 @@ func (this *AnnexBParser) handleNALU(naluType byte, payload []byte, ts uint32) (
 		}
 
 		// Optimization: preallocate buffer to avoid costly multiple appends
+		// If SPS/PPS are missing, don't inject empty parameter sets.
+		if len(this.sps) == 0 || len(this.pps) == 0 {
+			this.videoTS = ts
+			return payload, duration
+		}
+
 		totalSize := len(this.startCode)*3 + len(this.pps) + len(this.sps) + len(payload)
 		optimizedPayload := make([]byte, 0, totalSize)
 
@@ -253,6 +278,103 @@ func (this *AnnexBParser) handleNALU(naluType byte, payload []byte, ts uint32) (
 	// Update previous timestamp to current timestamp
 	this.videoTS = ts
 	return payload, duration
+}
+
+func (this *AnnexBParser) handleSTAPA(data []byte, timestamp uint32) ([]byte, uint32) {
+	// STAP-A: [24][size:2][nal][size:2][nal]...
+	if len(data) < 3 {
+		return nil, 0
+	}
+
+	offset := 1
+	emitFrame := false
+	keyframe := false
+	aggregated := make([]byte, 0, len(data)+len(this.startCode)*2)
+
+	for offset+2 <= len(data) {
+		nalSize := int(data[offset])<<8 | int(data[offset+1])
+		offset += 2
+		if nalSize <= 0 || offset+nalSize > len(data) {
+			Debug("H264", "Invalid STAP-A packet size")
+			return nil, 0
+		}
+
+		nal := data[offset : offset+nalSize]
+		offset += nalSize
+		if len(nal) == 0 {
+			continue
+		}
+
+		nalType := nal[0] & 0x1F
+		switch nalType {
+		case NALU_SPS:
+			this.updateSPS(nal)
+		case NALU_PPS:
+			this.updatePPS(nal)
+		case 5:
+			keyframe = true
+			emitFrame = true
+			aggregated = append(aggregated, this.startCode...)
+			aggregated = append(aggregated, nal...)
+		case 1, 2, 3, 4:
+			emitFrame = true
+			aggregated = append(aggregated, this.startCode...)
+			aggregated = append(aggregated, nal...)
+		default:
+			// Keep non-frame NALs out of output by default.
+		}
+	}
+
+	if !emitFrame || len(aggregated) == 0 {
+		return nil, 0
+	}
+
+	if keyframe && len(this.sps) > 0 && len(this.pps) > 0 {
+		withParams := make([]byte, 0, len(this.startCode)*2+len(this.sps)+len(this.pps)+len(aggregated))
+		withParams = append(withParams, this.startCode...)
+		withParams = append(withParams, this.sps...)
+		withParams = append(withParams, this.startCode...)
+		withParams = append(withParams, this.pps...)
+		withParams = append(withParams, aggregated...)
+		aggregated = withParams
+	}
+
+	duration := timestamp - this.videoTS
+	this.videoTS = timestamp
+	return aggregated, duration
+}
+
+func (this *AnnexBParser) detectSequenceGap(channel int, seq uint16) bool {
+	switch channel {
+	case 0:
+		if !this.hasVideoSeq {
+			this.videoSeq = seq
+			this.hasVideoSeq = true
+			return false
+		}
+		expected := this.videoSeq + 1
+		gap := seq != expected
+		if gap {
+			Debug("RTP", "Video RTP sequence gap detected: expected=%d got=%d", expected, seq)
+		}
+		this.videoSeq = seq
+		return gap
+	case 2:
+		if !this.hasAudioSeq {
+			this.audioSeq = seq
+			this.hasAudioSeq = true
+			return false
+		}
+		expected := this.audioSeq + 1
+		gap := seq != expected
+		if gap {
+			Debug("RTP", "Audio RTP sequence gap detected: expected=%d got=%d", expected, seq)
+		}
+		this.audioSeq = seq
+		return gap
+	default:
+		return false
+	}
 }
 
 func (this *AnnexBParser) splitNALUs(b []byte) (nalus [][]byte, typ int) {
@@ -338,17 +460,19 @@ func (this *AnnexBParser) U32BE(b []byte) uint32 {
 }
 
 func (this *AnnexBParser) updatePPS(b []byte) {
-	if len(this.pps) == 0 {
-		this.pps = b
-		Info("H264", "PPS updated (length: %d bytes)", len(this.pps))
-		Debug("H264", "PPS data: %v", this.pps)
+	if bytes.Equal(this.pps, b) {
+		return
 	}
+	this.pps = append(this.pps[:0], b...)
+	Info("H264", "PPS updated (length: %d bytes)", len(this.pps))
+	Debug("H264", "PPS data: %v", this.pps)
 }
 
 func (this *AnnexBParser) updateSPS(b []byte) {
-	if len(this.sps) == 0 {
-		this.sps = b
-		Info("H264", "SPS updated (length: %d bytes)", len(this.sps))
-		Debug("H264", "SPS data: %v", this.sps)
+	if bytes.Equal(this.sps, b) {
+		return
 	}
+	this.sps = append(this.sps[:0], b...)
+	Info("H264", "SPS updated (length: %d bytes)", len(this.sps))
+	Debug("H264", "SPS data: %v", this.sps)
 }
