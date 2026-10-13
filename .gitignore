@@ -2,3 +2,4 @@
 test.go
 test_*.go
 config.yaml
+dist/

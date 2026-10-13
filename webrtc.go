@@ -3,23 +3,29 @@ package main
 import (
 	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 type WebRTCProxy struct {
 	peerConnection *webrtc.PeerConnection
-	videoTrack     *webrtc.TrackLocalStaticSample
-	audioTrack     *webrtc.TrackLocalStaticSample
+	videoTrack     *webrtc.TrackLocalStaticRTP
+	audioTrack     *webrtc.TrackLocalStaticRTP
 
-	rtspUrl      string
-	rtspClient   *RtspClient
-	annexBParser *AnnexBParser
+	rtspUrl    string
+	rtspClient *RtspClient
 
 	videoCodec string
 	audioCodec string
+
+	closeOnce sync.Once
+
+	// pendingCandidates holds ICE candidates that arrived before SetRemoteDescription.
+	mu                sync.Mutex
+	pendingCandidates []webrtc.ICECandidateInit
+	remoteDescSet     bool
 
 	onLocalICECandidateReceived OnLocalICECandidateReceivedFunc
 	onConnectionStateChanged    OnConnectionStateChangedFunc
@@ -41,8 +47,6 @@ func NewWebRTCProxy(device Device) *WebRTCProxy {
 
 	// create a new object
 	Obj := &WebRTCProxy{
-		// create a new annexBParser
-		annexBParser: NewAnnexBParser(),
 		// set the RTSP URL
 		rtspUrl:    device.URL,
 		audioCodec: "audio/" + device.Audio,
@@ -68,26 +72,26 @@ func (wp *WebRTCProxy) OnConnectionStateChanged(callback OnConnectionStateChange
 	wp.onConnectionStateChanged = callback
 }
 
-// Close the WebRTC connection and the RTSP connection.
-//
-// wp method can be called multiple times without any problems.
+// Close terminates the WebRTC and RTSP connections. Safe to call from multiple goroutines;
+// the actual teardown runs exactly once per session.
 func (wp *WebRTCProxy) Close() {
-	// Close the WebRTC connection if it exists
-	if wp.peerConnection != nil {
-		Info("WEBRTC", "Closing WebRTC connection...")
-		wp.peerConnection.Close()
-		wp.peerConnection = nil
-	}
+	wp.closeOnce.Do(func() {
+		if wp.peerConnection != nil {
+			Info("WEBRTC", "Closing WebRTC connection...")
+			wp.peerConnection.Close()
+			wp.peerConnection = nil
+		}
 
-	// Close the RTSP connection if it exists
-	if wp.rtspClient != nil {
-		Info("RTSP", "Disconnecting from RTSP...")
-		wp.rtspClient.Close()
-		//wp.rtspClient = nil
-	}
-	if wp.onConnectionStateChanged != nil {
-		wp.onConnectionStateChanged(false)
-	}
+		if wp.rtspClient != nil {
+			Info("RTSP", "Disconnecting from RTSP...")
+			wp.rtspClient.Close()
+			wp.rtspClient = nil
+		}
+
+		if wp.onConnectionStateChanged != nil {
+			wp.onConnectionStateChanged(false)
+		}
+	})
 }
 
 // CreatePeerConnection creates a new PeerConnection and adds the video and audio tracks to it
@@ -95,6 +99,7 @@ func (wp *WebRTCProxy) Close() {
 // The method is called when the HandleOffer method is called and a new PeerConnection needs to be created.
 func (wp *WebRTCProxy) CreatePeerConnection(from string) error {
 	_ = from
+	wp.closeOnce = sync.Once{} // reset for new session
 	Info("WEBRTC", "Using standard ICE configuration with STUN servers")
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -125,13 +130,7 @@ func (wp *WebRTCProxy) CreatePeerConnection(from string) error {
 	wp.peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		Info("WEBRTC", "Connection state: %s", state.String())
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
-			Info("WEBRTC", "Closing RTSP connection...")
-			if wp.rtspClient != nil {
-				wp.rtspClient.Close()
-			}
-			if wp.onConnectionStateChanged != nil {
-				wp.onConnectionStateChanged(false)
-			}
+			wp.Close()
 		} else if state == webrtc.PeerConnectionStateConnected {
 			wp.logSelectedICEPairNetwork()
 			go wp.StartRTSPStream()
@@ -147,7 +146,7 @@ func (wp *WebRTCProxy) CreatePeerConnection(from string) error {
 	})
 
 	// Create a new video track and add it to the peer connection
-	wp.videoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: wp.videoCodec}, "video", "rtsp-video")
+	wp.videoTrack, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: wp.videoCodec}, "video", "rtsp-video")
 	if err != nil {
 		Error("WEBRTC", "Error creating video track: %v", err)
 		return err
@@ -160,7 +159,7 @@ func (wp *WebRTCProxy) CreatePeerConnection(from string) error {
 	}
 
 	// Create a new audio track and add it to the peer connection
-	wp.audioTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: wp.audioCodec}, "audio", "rtsp-audio")
+	wp.audioTrack, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: wp.audioCodec}, "audio", "rtsp-audio")
 	if err == nil {
 		_, err = wp.peerConnection.AddTrack(wp.audioTrack)
 		if err != nil {
@@ -174,22 +173,27 @@ func (wp *WebRTCProxy) CreatePeerConnection(from string) error {
 	return nil
 }
 
-// AddICECandidate adds an ICE candidate to the existing PeerConnection.
-// Returns an error if the PeerConnection is nil or if adding the candidate fails.
+// AddICECandidate adds an ICE candidate, queuing it if SetRemoteDescription has not yet been called.
 func (wp *WebRTCProxy) AddICECandidate(candidate webrtc.ICECandidateInit) error {
-	// Check if the PeerConnection exists
+	wp.mu.Lock()
+	defer wp.mu.Unlock()
+
 	if wp.peerConnection == nil {
 		Error("WEBRTC", "PeerConnection is null")
 		return errors.New("PeerConnection is null")
 	}
 
-	// Try to add the ICE candidate to the PeerConnection
+	if !wp.remoteDescSet {
+		Debug("WEBRTC", "Remote description not set yet, queuing ICE candidate")
+		wp.pendingCandidates = append(wp.pendingCandidates, candidate)
+		return nil
+	}
+
 	if err := wp.peerConnection.AddICECandidate(candidate); err != nil {
 		Error("WEBRTC", "Error while adding ICE candidate: %v", err)
 		return err
 	}
 
-	// Successfully added the ICE candidate
 	Debug("WEBRTC", "ICE candidate added successfully")
 	return nil
 }
@@ -206,6 +210,12 @@ func (wp *WebRTCProxy) HandleOffer(from string, offer webrtc.SessionDescription)
 		return nil, errors.New("PeerConnection already exists")
 	}
 
+	// Reset ICE candidate queue for the new session.
+	wp.mu.Lock()
+	wp.pendingCandidates = wp.pendingCandidates[:0]
+	wp.remoteDescSet = false
+	wp.mu.Unlock()
+
 	if err := wp.CreatePeerConnection(from); err != nil {
 		Error("WEBRTC", "Error creating peer connection: %v", err)
 		return nil, err
@@ -217,6 +227,22 @@ func (wp *WebRTCProxy) HandleOffer(from string, offer webrtc.SessionDescription)
 		return nil, err
 	}
 	Debug("WEBRTC", "SetRemoteDescription successful")
+
+	// Mark remote description as set and flush any queued ICE candidates.
+	wp.mu.Lock()
+	wp.remoteDescSet = true
+	pending := wp.pendingCandidates
+	wp.pendingCandidates = nil
+	wp.mu.Unlock()
+
+	for _, c := range pending {
+		if err := wp.peerConnection.AddICECandidate(c); err != nil {
+			Warn("WEBRTC", "Error adding queued ICE candidate: %v", err)
+		}
+	}
+	if len(pending) > 0 {
+		Debug("WEBRTC", "Flushed %d queued ICE candidates", len(pending))
+	}
 
 	answer, err := wp.peerConnection.CreateAnswer(nil)
 	if err != nil {
@@ -235,96 +261,122 @@ func (wp *WebRTCProxy) HandleOffer(from string, offer webrtc.SessionDescription)
 	return wp.peerConnection.CurrentLocalDescription(), nil
 }
 
-// sendPacket sends a packet to the WebRTC peer.
+// sendRTPPacket forwards an RTP packet extracted from RTSP interleaved TCP.
 //
-// The payload is the content of the packet.
-// The timestamp is the timestamp of the packet.
-// The isVideo parameter indicates if the packet is a video or audio packet.
-//
-// The method returns an error if the packet cannot be sent.
-func (wp *WebRTCProxy) sendPacket(payload []byte, timestamp uint32, isVideo bool) error {
-	// If the packet is a video packet and the video track is not nil, write the packet to the track.
-	if isVideo && wp.videoTrack != nil {
-		return wp.videoTrack.WriteSample(media.Sample{
-			Data:     payload,
-			Duration: time.Millisecond * time.Duration(timestamp),
-		})
+// The RTSP client keeps the camera packetization intact; Pion rewrites only the
+// SSRC/PayloadType negotiated for the WebRTC sender.
+func (wp *WebRTCProxy) sendRTPPacket(data []byte) error {
+	if len(data) <= 4 {
+		return nil
 	}
-	// If the packet is an audio packet and the audio track is not nil, write the packet to the track.
-	if !isVideo && wp.audioTrack != nil {
-		return wp.audioTrack.WriteSample(media.Sample{
-			Data:     payload,
-			Duration: time.Millisecond * time.Duration(timestamp),
-		})
+
+	channel := data[1]
+	packetBytes := data[4:]
+
+	switch channel {
+	case 0:
+		if wp.videoTrack == nil {
+			return nil
+		}
+		_, err := wp.videoTrack.Write(packetBytes)
+		return err
+	case 2:
+		if wp.audioTrack == nil {
+			return nil
+		}
+		_, err := wp.audioTrack.Write(packetBytes)
+		return err
+	case 1, 3:
+		// RTCP interleaved channels are ignored for now.
+		return nil
+	default:
+		Debug("RTSP", "Ignoring unsupported interleaved channel %d", channel)
+		return nil
 	}
-	// If the packet is not a video or audio packet, return an error.
-	return nil
 }
 
-// StartRTSPStream starts the RTSP stream.
-//
-// wp method is used to start the RTSP stream and handle the incoming packets.
+// StartRTSPStream starts the RTSP stream with automatic reconnection on failure.
 func (wp *WebRTCProxy) StartRTSPStream() {
-	Info("RTSP", "Connecting to RTSP %s...", wp.rtspUrl)
+	const maxAttempts = 5
 
-	wp.rtspClient = NewRtspClient()
-	wp.annexBParser.reset()
-
-	if err := wp.rtspClient.Client(wp.rtspUrl, false); err == nil {
-		Info("RTSP", "Connected")
-
-		// Counters to reduce log frequency
-		packetCount := 0
-		lastLogTime := time.Now()
-		noPayloadCount := 0
-
-		for {
-			select {
-			case data := <-wp.rtspClient.received:
-				if len(data) > 12 {
-					// Process the packet
-					payload, duration := wp.annexBParser.handlePacket(&data)
-
-					if payload != nil {
-						// Send the packet to the WebRTC client
-						if err := wp.sendPacket(payload, duration, data[1] == 0); err != nil {
-							// Log only in case of error
-							Error("RTSP", "Error sending packet: %v", err)
-						}
-
-						// Increment packet counter
-						packetCount++
-
-						// Periodic logging (every 5 seconds) to reduce CPU usage
-						if time.Since(lastLogTime) > 5*time.Second {
-							Debug("RTSP", "Processed %d packets in last 5 seconds", packetCount)
-							packetCount = 0
-							lastLogTime = time.Now()
-
-							// Reset the counter for packets without payload
-							if noPayloadCount > 0 {
-								Debug("RTSP", "%d packets had no payload", noPayloadCount)
-								noPayloadCount = 0
-							}
-						}
-					} else {
-						// Count packets without payload instead of logging them individually
-						noPayloadCount++
-					}
-				} else if len(data) > 0 {
-					// Keep short-packet logs in debug mode to avoid noisy normal runtime.
-					Debug("RTSP", "Packet too short to contain an RTP header")
-				}
-				// Return packet buffer to pool when it originates from RtspClient.
-				rtpPacketPool.Put(data[:0])
-			case <-wp.rtspClient.signals:
-				Info("RTSP", "Exit signal received from RTSP client")
-				return
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
 			}
+			Warn("RTSP", "Reconnect attempt %d/%d in %v", attempt, maxAttempts, backoff)
+			time.Sleep(backoff)
 		}
-	} else {
-		Error("RTSP", "Connection error: %v", err)
-		wp.Close()
+
+		// Stop if the WebRTC session was closed while we were waiting.
+		if wp.peerConnection == nil {
+			return
+		}
+
+		Info("RTSP", "Connecting to RTSP %s...", wp.rtspUrl)
+		wp.rtspClient = NewRtspClient()
+
+		if err := wp.rtspClient.Client(wp.rtspUrl, false); err != nil {
+			Error("RTSP", "Connection error: %v", err)
+			continue
+		}
+
+		Info("RTSP", "Connected")
+		wp.consumeRTPPackets()
+
+		// consumeRTPPackets returned: either the RTSP session ended or WebRTC closed.
+		if wp.peerConnection == nil {
+			return
+		}
+
+		Warn("RTSP", "RTSP session ended, will reconnect")
+	}
+
+	Error("RTSP", "Max reconnect attempts reached, closing session")
+	wp.Close()
+}
+
+// consumeRTPPackets forwards packets from the RTSP client to the WebRTC tracks
+// until the RTSP session ends or a signal is received.
+func (wp *WebRTCProxy) consumeRTPPackets() {
+	packetCount := 0
+	lastLogTime := time.Now()
+	droppedCount := 0
+
+	for {
+		select {
+		case data := <-wp.rtspClient.received:
+			if len(data) > 12 {
+				if data[1] == 0 || data[1] == 2 {
+					if err := wp.sendRTPPacket(data); err != nil {
+						Error("RTSP", "Error sending RTP packet: %v", err)
+					} else {
+						packetCount++
+					}
+
+					if time.Since(lastLogTime) > 5*time.Second {
+						Debug("RTSP", "Forwarded %d RTP packets in last 5 seconds", packetCount)
+						packetCount = 0
+						lastLogTime = time.Now()
+						if droppedCount > 0 {
+							Debug("RTSP", "%d packets were ignored in last 5 seconds", droppedCount)
+							droppedCount = 0
+						}
+					}
+				} else {
+					droppedCount++
+				}
+			} else if len(data) > 0 {
+				Debug("RTSP", "Packet too short to contain an RTP header")
+				droppedCount++
+			}
+			rtpPacketPool.Put(data[:0])
+
+		case <-wp.rtspClient.signals:
+			Info("RTSP", "Exit signal received from RTSP client")
+			return
+		}
 	}
 }
 

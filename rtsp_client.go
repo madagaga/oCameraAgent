@@ -38,9 +38,9 @@ type RtspClient struct {
 // returns an empty initialized object
 func NewRtspClient() *RtspClient {
 	Obj := &RtspClient{
-		cseq:     1,                       // starting query number
-		signals:  make(chan bool, 1),      // buffered channel for 1 message
-		received: make(chan []byte, 5000), // reduced from 100000 to 5000 to save memory
+		cseq:     1,                      // starting query number
+		signals:  make(chan bool, 1),     // buffered channel for 1 message
+		received: make(chan []byte, 512), // bounded queue to limit retained RTP buffers under backpressure
 	}
 	return Obj
 }
@@ -143,53 +143,46 @@ extension (X): 1 bit
 */
 func (rc *RtspClient) RtspRtpLoop() {
 	defer func() {
-		// Recover from panics to avoid crashes
 		if r := recover(); r != nil {
 			Error("RTSP", "Recovered from panic in RtspRtpLoop: %v", r)
 		}
-		// Signal the end of the loop
 		rc.signals <- true
 	}()
 
 	header := make([]byte, 4)
-	payload := make([]byte, 65536) // Increased from 1600 to 64KB to handle larger payloads
+	payload := make([]byte, 8192)
 
-	timer := time.Now()
-	keepaliveInterval := 50 * time.Second
+	// Keepalive ticker: fires every 50 s off the hot path.
+	keepaliveTicker := time.NewTicker(50 * time.Second)
+	defer keepaliveTicker.Stop()
+
 	reconnectAttempts := 0
-	maxReconnectAttempts := 5
+	const maxReconnectAttempts = 5
 
 	for {
-		// Send OPTIONS request periodically to keep the connection alive
-		if time.Since(timer) > keepaliveInterval {
+		// Non-blocking check for keepalive tick.
+		select {
+		case <-keepaliveTicker.C:
 			if _, _, err := rc.SendRequest("OPTIONS", rc.uri, nil); err != nil {
 				Error("RTSP", "Keepalive failed: %v", err)
-
-				// Reconnection attempt with exponential backoff
 				reconnectAttempts++
 				if reconnectAttempts > maxReconnectAttempts {
 					Error("RTSP", "Max reconnect attempts reached (%d), giving up", maxReconnectAttempts)
 					return
 				}
-
-				// Wait before retrying (exponential backoff)
-				backoffTime := time.Duration(1<<uint(reconnectAttempts-1)) * time.Second
-				if backoffTime > 30*time.Second {
-					backoffTime = 30 * time.Second // Cap at 30 seconds
+				backoff := time.Duration(1<<uint(reconnectAttempts-1)) * time.Second
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
 				}
-
-				Warn("RTSP", "Reconnect attempt %d/%d in %v", reconnectAttempts, maxReconnectAttempts, backoffTime)
-				time.Sleep(backoffTime)
+				Warn("RTSP", "Reconnect attempt %d/%d in %v", reconnectAttempts, maxReconnectAttempts, backoff)
+				time.Sleep(backoff)
 				continue
 			}
-
-			// Reset timer and attempt counter after successful keepalive
-			timer = time.Now()
 			reconnectAttempts = 0
 			Debug("RTSP", "Keepalive successful")
+		default:
 		}
 
-		// Read TCP packets
 		if err := rc.handleTCPPackets(header, payload); err != nil {
 			Error("RTSP", "TCP read error: %v", err)
 			return
@@ -197,19 +190,20 @@ func (rc *RtspClient) RtspRtpLoop() {
 	}
 }
 
-// Preallocated buffer for complete RTP packets (header + payload)
-// This avoids repeated allocations that create pressure on the GC
+// rtpPacketPool reuses RTP packet buffers to reduce GC pressure.
+// 2 KB covers the typical RTP/H.264 packet (≤ MTU). Larger packets cause append
+// to grow the slice; those oversized buffers are not returned to the pool.
 var rtpPacketPool = sync.Pool{
 	New: func() interface{} {
-		// Preallocate a buffer large enough for most packets
-		return make([]byte, 0, 65536) // Increased from 2048 to match the larger payload size
+		return make([]byte, 0, 2048)
 	},
 }
 
 // Method to handle TCP packets
 func (rc *RtspClient) handleTCPPackets(header []byte, payload []byte) error {
-	// Set a timeout for reading
-	rc.socket.SetDeadline(time.Now().Add(1 * time.Second))
+	// Set a read deadline only once per call rather than per-byte.
+	// 5 s gives enough slack for a bursty camera without burning syscalls on every packet.
+	rc.socket.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	// Read the interleaved header
 	n, err := io.ReadFull(rc.reader, header)
@@ -235,7 +229,8 @@ func (rc *RtspClient) handleTCPPackets(header []byte, payload []byte) error {
 	// Extract the payload length from the header
 	payloadLen := int(header[2])<<8 + int(header[3])
 	if payloadLen > len(payload) {
-		return fmt.Errorf("payload length too large: %d > %d", payloadLen, len(payload))
+		// Grow the read buffer to fit this unusually large frame.
+		payload = make([]byte, payloadLen)
 	}
 
 	if payloadLen < 12 {
@@ -295,7 +290,7 @@ func (rc *RtspClient) Connect() bool {
 	}
 
 	rc.socket = conn
-	rc.reader = bufio.NewReaderSize(conn, 64*1024)
+	rc.reader = bufio.NewReaderSize(conn, 16*1024)
 	Info("RTSP", "Connected successfully")
 	return true
 }
@@ -307,10 +302,15 @@ var requestBufferPool = sync.Pool{
 	},
 }
 
+// SendRequest acquires ioMu and delegates to sendRequest.
 func (rc *RtspClient) SendRequest(requestType string, uri string, content map[string]string) (int, string, error) {
 	rc.ioMu.Lock()
 	defer rc.ioMu.Unlock()
+	return rc.sendRequest(requestType, uri, content)
+}
 
+// sendRequest executes an RTSP request. Caller must hold ioMu.
+func (rc *RtspClient) sendRequest(requestType string, uri string, content map[string]string) (int, string, error) {
 	if rc.socket == nil {
 		return 0, "", errors.New("socket is not initialized")
 	}
@@ -524,11 +524,11 @@ func (rc *RtspClient) Close() {
 
 	// Properly close the RTSP connection
 	if rc.socket != nil {
-		// Send TEARDOWN to inform the RTSP server
+		// Send TEARDOWN to inform the RTSP server.
+		// Use sendRequest (no lock) because Close() already holds ioMu.
 		if rc.session != "" {
-			// Ignore errors since we're closing the connection anyway
 			Info("RTSP", "Sending TEARDOWN request")
-			rc.SendRequest("TEARDOWN", rc.uri, nil)
+			rc.sendRequest("TEARDOWN", rc.uri, nil)
 		}
 
 		// Close the TCP socket
@@ -537,13 +537,15 @@ func (rc *RtspClient) Close() {
 		rc.reader = nil
 	}
 
-	// Clear channels to avoid memory leaks
-	// Empty the received channel without blocking
-	select {
-	case <-rc.received:
-		// Empty one message
-	default:
-		// Channel already empty
+	// Drain all buffered packets and return their memory to the pool.
+drain:
+	for {
+		select {
+		case b := <-rc.received:
+			rtpPacketPool.Put(b[:0])
+		default:
+			break drain
+		}
 	}
 
 	Info("RTSP", "Resources released")

@@ -91,7 +91,7 @@ func NewMqttClient(clientId string, username string, password string, url string
 		}).
 		SetMessageChannelDepth(255).
 		SetTLSConfig(tlsconfig).
-		SetCleanSession(false)
+		SetCleanSession(true)
 
 	if Obj.Username != "" && Obj.Password != "" {
 		mqttOptions.SetUsername(Obj.Username)
