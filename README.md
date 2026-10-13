@@ -1,87 +1,44 @@
-# RTSP to WebRTC proxy
+# oCamera agent (RTSP to WebRTC proxy)
 
-This project allows to forward RTSP streams to WebRTC peers.
+Agent qui relaie un flux RTSP vers un viewer WebRTC. La signalisation passe par MQTT selon le
+protocole version 1, décrit dans `MQTT_PROTOCOL.md` (à la racine du projet, hors de ce dépôt).
 
 ## Configuration
 
-The configuration is stored in a YAML file named `config.yaml`. The following keys are available:
+Fichier YAML (`config.yaml`, voir `config.yaml.template`) :
 
-* `Device.URL`: The URL of the RTSP stream to forward
-* `MQTT.Username`: The username to use to connect to the MQTT broker
-* `MQTT.Password`: The password to use to connect to the MQTT broker
-* `MQTT.URL`: The URL of the MQTT broker
-* `MQTT.Name`: The name to use to identify the proxy in the MQTT broker
+| Clé | Description |
+|---|---|
+| `mqtt.url` | URL du broker, ex. `ssl://broker:8883` (TLS, certificat validé) |
+| `mqtt.username` | **Identifiant de la caméra** (3-32 car. `[A-Za-z0-9_-]`), aussi `clientId` MQTT |
+| `mqtt.password` | Mot de passe du compte caméra |
+| `mqtt.ca` | (optionnel) Fichier PEM d'un CA personnalisé pour valider le broker |
+| `device.name` | Nom affiché (défaut : l'identifiant) |
+| `device.url` | URL RTSP source |
+| `device.video` / `device.audio` | Codecs, ex. `H264` / `PCMU` |
+| `ice.stun` | (optionnel) Liste de serveurs STUN ; défaut : STUN publics Google |
 
-## How to use
+Les mots de passe et les identifiants RTSP ne sont jamais journalisés.
 
-1. Build the project using `go build`
-2. Copy the `config.yaml` to the same directory as the executable
-3. Run the executable
+## Utilisation
 
-The proxy will then forward the RTSP stream to WebRTC peers connected to the MQTT broker.
+1. `go build` (ou `build-musl.ps1` pour les cibles embarquées)
+2. Placer `config.yaml` à côté de l'exécutable
+3. Lancer `oCameraAgent [-config config.yaml] [-debug]`
 
-## MQTT signaling
+## Protocole (résumé)
 
-The proxy and client use mqtt for signaling and google for turn/stun. 
+* `ocam/dev/{id}/state` : état retained (`online`, `busy`, `viewer`, `caps`...) + Last Will
+* `ocam/dev/{id}/in/{viewer}` : messages reçus (`offer`, `ice`, `bye`, `cmd`)
+* `ocam/cli/{viewer}/in/{id}` : messages émis (`answer`, `ice`, `bye`, `error`, `res`)
+* Une seule session à la fois ; une seconde offre reçoit `error busy` sans perturber la session active.
+* Au démarrage, l'agent tente de s'abonner à `ocam/dev/+/state` (interdit à une caméra) et avertit
+  si le broker l'accepte (ACL non appliquée).
 
-### Declaring device 
-The proxy sends a message to the MQTT broker with the topic `devices` and the payload
-being a JSON object containing the following keys:
+## Architecture
 
-* `id`: The id of the device
-* `name`: The name of the device
-* `online`: true if the device is online, false otherwise
-* `streaming`: true if the device is currently streaming, false otherwise
-* `type`: The type of the device, always `sender` for the proxy.
-
-This message is sent every time the proxy starts and every time a query request is received.
-
-### Topics : 
-The proxy and client use the following topics in the MQTT broker:
-
-### `/devices` topic
-The proxy sends a message to this topic with the payload being a JSON object containing the following keys:
-
-* `id`: The id of the device
-* `name`: The name of the device
-* `online`: true if the device is online, false otherwise
-* `streaming`: true if the device is currently streaming, false otherwise
-* `type`: The type of the device, always `sender` for the proxy.
-
-This message is sent every time the proxy starts and every time a query request is received.
-
-### `/<clientID>` topic 
-This topic is used to send / receive message between 2 peers
-Every client is listening to the /clientId topic. 
-
-#### `SDP` message
-The proxy and client use this topic to send and receive SDP messages.
-
-The message payload is a JSON object containing the following keys:
-
-* `source`: The id of the device that sent the message
-* `type`: The type of the message, always `sdp`
-* `data`: The SDP message wich can be offer or answer. 
-
-#### `ICE` message
-The proxy and client use this topic to send and receive ICE messages.
-
-The message payload is a JSON object containing the following keys:
-
-* `source`: The id of the device that sent the message
-* `type`: The type of the message, always `ice`
-* `data`: The ICE message
-
-### `Hangup` message
-Send and receive hangup messages.
-
-The message payload is a JSON object containing the following keys:
-
-* `source`: The id of the device that sent the message
-* `type`: The type of the message, always `hangup`
-
-### `Query`message
-Send and receive device query message 
-
-* `source`: The id of the device that sent the message
-* `type`: The type of the message, always `Query`
+* `protocol.go` : enveloppe, types de messages, codes d'erreur
+* `mqtt.go` : connexion, topics, Last Will, publication
+* `agent.go` : machine de session (`idle` / `busy`), regroupement des candidats ICE
+* `webrtc.go` : PeerConnection et relais RTP d'une session
+* `rtsp_client.go` : client RTSP (TCP interleaved)

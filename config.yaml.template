@@ -1,9 +1,16 @@
 mqtt:
-  url: "ssl://broker:port"  
-  username: "username"
+  url: "ssl://broker:8883"
+  username: "cam-entree"      # identifiant de la caméra (3-32 car. [A-Za-z0-9_-]) = clientId MQTT
   password: "password"
-  name: "Camera 1"
+  # ca: "/etc/ocamera/ca.crt" # CA personnalisé du broker (optionnel ; sinon magasin système)
 
 device:
-  url: "rtsp://ip:port/stream"
-  id: "uniqueid"
+  name: "Entrée"              # nom affiché dans l'application (défaut : l'identifiant)
+  url: "rtsp://ip:554/stream"
+  video: "H264"               # H264 | H265
+  audio: "PCMU"               # PCMA | PCMU | opus
+
+# Optionnel : serveurs STUN (défaut : STUN publics Google). Aucun TURN n'est nécessaire côté agent.
+# ice:
+#   stun:
+#     - "stun:stun.l.google.com:19302"
