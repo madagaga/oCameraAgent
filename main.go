@@ -1,66 +1,39 @@
 package main
 
 import (
-    "os"
-    "os/signal"
-    "syscall"
-    "github.com/pion/webrtc/v4"
-    "flag"
+	"flag"
+	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
-    configFile := flag.String("config", "config.yaml", "config file path")
-    debug := flag.Bool("debug", false, "enable debug logging")
-    flag.Parse()
-    
-    // Initialize logger
-    InitLogger(*debug)
-    Info("MAIN", "Starting RTSP-WebRTC proxy...")
+	configFile := flag.String("config", "config.yaml", "config file path")
+	debug := flag.Bool("debug", false, "enable debug logging")
+	flag.Parse()
 
-    config, err := loadConfig(*configFile)
-    if err != nil {
-        Fatal("MAIN", "Error while loading config: %v", err)
-    }
+	// Initialize logger
+	InitLogger(*debug)
+	Info("MAIN", "Starting oCamera agent %s (protocol v%d)...", AgentVersion, ProtocolVersion)
 
-    // build proxy client
-    webrtcProxy := NewWebRTCProxy(config.Device)
-    
-    // build signaling 
-    mqttClient := NewMqttClient(config.Device.ID, config.MQTT.Username, config.MQTT.Password, config.MQTT.URL)
-    mqttClient.Name = config.MQTT.Name
-    mqttClient.OnOfferReceived(func(source string, offer webrtc.SessionDescription) {
-        answer, err := webrtcProxy.HandleOffer(source, offer)
-        if err != nil {
-            Error("MQTT", "Error while handling SDP: %v", err) 
-            mqttClient.SendError(source, err)
-            mqttClient.Hangup(source)
-        } else {
-            mqttClient.SendAnswerSDP(source, answer)
-        }
-    })
+	config, err := loadConfig(*configFile)
+	if err != nil {
+		Fatal("MAIN", "Error while loading config: %v", err)
+	}
+	Info("MAIN", "Camera id=%s name=%q", config.ID(), config.Device.Name)
 
-    mqttClient.OnRemoteICECandidateReceived(func(source string, ice webrtc.ICECandidateInit) {
-        webrtcProxy.AddICECandidate(ice)
-    })
-    
-    mqttClient.OnHangupReceived(func() {
-        webrtcProxy.Close()
-    })
+	agent, err := NewAgent(config)
+	if err != nil {
+		Fatal("MAIN", "Error while creating agent: %v", err)
+	}
+	if err := agent.Run(); err != nil {
+		Fatal("MAIN", "MQTT connection error: %v", err)
+	}
 
-    webrtcProxy.OnLocalICECandidateReceived(func(source string, ice *webrtc.ICECandidate) {
-        mqttClient.SendICECandidate(source, ice)
-    })
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+	<-c
 
-    webrtcProxy.OnConnectionStateChanged(func(streaming bool) {
-        mqttClient.streaming = streaming
-        mqttClient.PublishDeviceInfo()
-    })
-    
-    c := make(chan os.Signal, 1)
-    signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
-    <-c
-
-    Info("MAIN", "Closing app...")
-    webrtcProxy.Close()
-    mqttClient.Close()
+	Info("MAIN", "Closing app...")
+	agent.Shutdown()
 }

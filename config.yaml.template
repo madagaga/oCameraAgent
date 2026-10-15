@@ -1,9 +1,15 @@
 mqtt:
-  url: "ssl://broker:port"  
-  username: "username"
+  url: "ssl://broker:8883"
+  username: "cam-entree"      # camera identifier (3-32 chars [A-Za-z0-9_-]) = MQTT clientId
   password: "password"
-  name: "Camera 1"
+  # ca: "/etc/ocamera/ca.crt" # custom CA of the broker (optional; defaults to the system store)
 
 device:
-  url: "rtsp://ip:port/stream"
-  id: "uniqueid"
+  name: "Entrée"              # display name shown by viewers (default: the identifier)
+  url: "rtsp://ip:554/stream"
+  # probe_interval: 30        # seconds between source probes (default 30, minimum 5)
+
+# Optional: STUN servers (default: Google public STUN). The agent needs no TURN.
+# ice:
+#   stun:
+#     - "stun:stun.l.google.com:19302"

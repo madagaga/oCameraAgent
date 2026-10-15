@@ -33,6 +33,10 @@ type RtspClient struct {
 	cseq     int      //qury number
 	videow   int
 	videoh   int
+
+	hdr     [4]byte // interleaved header (RtspRtpLoop goroutine only)
+	payload []byte  // read buffer kept between calls
+	desync  bool    // synchronization loss in progress
 }
 
 // returns an empty initialized object
@@ -45,16 +49,17 @@ func NewRtspClient() *RtspClient {
 	return Obj
 }
 
-// main function for working with RTSP
-func (rc *RtspClient) Client(rtsp_url string, _ bool) error {
+// describe connects to the camera and runs OPTIONS then DESCRIBE; it returns the DESCRIBE response
+// (headers and SDP body).
+func (rc *RtspClient) describe(rtsp_url string) (string, error) {
 	// check and parse URL
 	if !rc.ParseUrl(rtsp_url) {
-		return errors.New("Invalid URL")
+		return "", errors.New("Invalid URL")
 	}
 
 	// establish connection to the camera
 	if !rc.Connect() {
-		return errors.New("Unable to connect")
+		return "", errors.New("Unable to connect")
 	}
 	// phase 1 OPTIONS - first stage of communication with the camera
 	// send OPTIONS request and read response to the OPTIONS request
@@ -63,13 +68,95 @@ func (rc *RtspClient) Client(rtsp_url string, _ bool) error {
 	}
 
 	// PHASE 2 DESCRIBE
-	if status, message, err := rc.SendRequest("DESCRIBE", rc.uri, nil); err != nil {
-		return errors.New("Unable to read DESCRIBE response; connection lost?")
-	} else if status != 200 {
-		return errors.New("DESCRIBE error; not status code 200 OK " + message)
-	} else {
-		rc.track = rc.ParseMedia(message)
+	status, message, err := rc.SendRequest("DESCRIBE", rc.uri, nil)
+	if err != nil {
+		return "", errors.New("Unable to read DESCRIBE response; connection lost?")
 	}
+	if status != 200 {
+		return "", errors.New("DESCRIBE error; not status code 200 OK")
+	}
+	return message, nil
+}
+
+// SourceInfo is what a camera announces in its DESCRIBE response.
+type SourceInfo struct {
+	Video []string // lower-case codec names in announced order, e.g. "h264"
+	Audio []string
+}
+
+// ProbeSource opens a short RTSP session (OPTIONS + DESCRIBE, no SETUP/PLAY), reads the announced
+// codecs and closes the connection.
+func ProbeSource(rtsp_url string) (*SourceInfo, error) {
+	rc := NewRtspClient()
+	defer rc.Close()
+
+	message, err := rc.describe(rtsp_url)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCodecs(message), nil
+}
+
+// ParseCodecs extracts the codec names announced per media section of an SDP. Static audio payload
+// types without rtpmap (0 = PCMU, 8 = PCMA) are recognized too.
+func ParseCodecs(sdp string) *SourceInfo {
+	info := &SourceInfo{}
+	media := ""
+	rtpmapSeen := false
+	var staticAudio []string
+	flush := func() {
+		if media == "audio" && !rtpmapSeen {
+			info.Audio = append(info.Audio, staticAudio...)
+		}
+		rtpmapSeen = false
+		staticAudio = nil
+	}
+
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "m="):
+			flush()
+			fields := strings.Fields(line[2:])
+			media = ""
+			if len(fields) > 0 && (fields[0] == "video" || fields[0] == "audio") {
+				media = fields[0]
+			}
+			if media == "audio" && len(fields) > 3 {
+				for _, pt := range fields[3:] {
+					switch pt {
+					case "0":
+						staticAudio = append(staticAudio, "pcmu")
+					case "8":
+						staticAudio = append(staticAudio, "pcma")
+					}
+				}
+			}
+		case strings.HasPrefix(line, "a=rtpmap:") && media != "":
+			// a=rtpmap:96 H264/90000
+			rest := line[len("a=rtpmap:"):]
+			if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+				name := strings.ToLower(strings.SplitN(strings.TrimSpace(rest[sp+1:]), "/", 2)[0])
+				if media == "video" {
+					info.Video = append(info.Video, name)
+				} else {
+					info.Audio = append(info.Audio, name)
+					rtpmapSeen = true
+				}
+			}
+		}
+	}
+	flush()
+	return info
+}
+
+// main function for working with RTSP
+func (rc *RtspClient) Client(rtsp_url string, _ bool) error {
+	message, err := rc.describe(rtsp_url)
+	if err != nil {
+		return err
+	}
+	rc.track = rc.ParseMedia(message)
 	if len(rc.track) == 0 {
 		return errors.New("Error; track not found")
 	}
@@ -149,8 +236,7 @@ func (rc *RtspClient) RtspRtpLoop() {
 		rc.signals <- true
 	}()
 
-	header := make([]byte, 4)
-	payload := make([]byte, 8192)
+	rc.payload = make([]byte, 8192)
 
 	// Keepalive ticker: fires every 50 s off the hot path.
 	keepaliveTicker := time.NewTicker(50 * time.Second)
@@ -183,7 +269,7 @@ func (rc *RtspClient) RtspRtpLoop() {
 		default:
 		}
 
-		if err := rc.handleTCPPackets(header, payload); err != nil {
+		if err := rc.handleTCPPackets(); err != nil {
 			Error("RTSP", "TCP read error: %v", err)
 			return
 		}
@@ -199,53 +285,60 @@ var rtpPacketPool = sync.Pool{
 	},
 }
 
-// Method to handle TCP packets
-func (rc *RtspClient) handleTCPPackets(header []byte, payload []byte) error {
+// handleTCPPackets reads an interleaved frame ($ channel length data) and queues it in rc.received.
+// The header is inspected with Peek: a timeout consumes nothing, and a synchronization loss is
+// recovered byte by byte up to the next 0x24.
+func (rc *RtspClient) handleTCPPackets() error {
 	// Set a read deadline only once per call rather than per-byte.
 	// 5 s gives enough slack for a bursty camera without burning syscalls on every packet.
 	rc.socket.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	// Read the interleaved header
-	n, err := io.ReadFull(rc.reader, header)
+	head, err := rc.reader.Peek(4)
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			// Read timeout - this is normal, continue
+			// Read timeout - this is normal, continue (no byte consumed)
 			return nil
 		}
 		return fmt.Errorf("failed to read interleaved header: %v", err)
 	}
 
-	if n != 4 {
-		return fmt.Errorf("incomplete header read: %d bytes", n)
+	// Check the interleaved marker (0x24, '$')
+	if head[0] != 0x24 {
+		if !rc.desync {
+			Warn("RTSP", "Unexpected start byte 0x%02x; resynchronizing", head[0])
+			rc.desync = true
+		}
+		rc.reader.Discard(1)
+		return nil
+	}
+	if rc.desync {
+		Info("RTSP", "Synchronization recovered")
+		rc.desync = false
 	}
 
-	// Check the RTP marker (0x24 in hex, or 36 in decimal)
-	if header[0] != 36 {
-		Warn("RTSP", "Unexpected start byte; synchronization lost")
-		// Try to resynchronize by reading byte by byte until finding 0x24
+	copy(rc.hdr[:], head)
+	rc.reader.Discard(4)
+	channel := rc.hdr[1]
+	payloadLen := int(rc.hdr[2])<<8 | int(rc.hdr[3])
+
+	// RTCP (odd) and unknown channels are not forwarded: their data is consumed.
+	if (channel != 0 && channel != 2) || payloadLen < 12 {
+		if payloadLen > 0 {
+			if _, err := rc.reader.Discard(payloadLen); err != nil {
+				return fmt.Errorf("error discarding interleaved frame: %v", err)
+			}
+		}
 		return nil
 	}
 
-	// Extract the payload length from the header
-	payloadLen := int(header[2])<<8 + int(header[3])
-	if payloadLen > len(payload) {
-		// Grow the read buffer to fit this unusually large frame.
-		payload = make([]byte, payloadLen)
-	}
-
-	if payloadLen < 12 {
-		Debug("RTSP", "Invalid payload length; discarding packet")
-		return nil
+	if payloadLen > len(rc.payload) {
+		// Grow the read buffer to fit this unusually large frame; it is kept for the next calls.
+		rc.payload = make([]byte, payloadLen)
 	}
 
 	// Read the RTP payload
-	n, err = io.ReadFull(rc.reader, payload[:payloadLen])
-	if err != nil {
+	if _, err := io.ReadFull(rc.reader, rc.payload[:payloadLen]); err != nil {
 		return fmt.Errorf("error reading RTP payload: %v", err)
-	}
-
-	if n != payloadLen {
-		return fmt.Errorf("incomplete payload read: %d/%d bytes", n, payloadLen)
 	}
 
 	// Get a buffer from the pool and use it to build the complete packet
@@ -254,8 +347,8 @@ func (rc *RtspClient) handleTCPPackets(header []byte, payload []byte) error {
 	rtpPacket = rtpPacket[:0] // Reset the buffer without reallocating
 
 	// Build the complete packet (header + payload)
-	rtpPacket = append(rtpPacket, header...)
-	rtpPacket = append(rtpPacket, payload[:payloadLen]...)
+	rtpPacket = append(rtpPacket, rc.hdr[:]...)
+	rtpPacket = append(rtpPacket, rc.payload[:payloadLen]...)
 
 	// Send the packet to the channel, with non-blocking handling
 	select {
@@ -510,7 +603,7 @@ func (rc *RtspClient) ParseUrl(rtsp_url string) bool {
 	}
 	rc.login = u.User.Username()
 	rc.password, _ = u.User.Password()
-	Info("RTSP", "URL parsed - host: %s, port: %s, login: %s", rc.host, rc.port, rc.login)
+	Info("RTSP", "URL parsed - host: %s, port: %s", rc.host, rc.port)
 	rc.uri = "rtsp://" + rc.host + ":" + rc.port + u.Path
 	if u.RawQuery != "" {
 		rc.uri += "?" + string(u.RawQuery)
