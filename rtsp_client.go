@@ -49,16 +49,17 @@ func NewRtspClient() *RtspClient {
 	return Obj
 }
 
-// main function for working with RTSP
-func (rc *RtspClient) Client(rtsp_url string, _ bool) error {
+// describe connects to the camera and runs OPTIONS then DESCRIBE; it returns the DESCRIBE response
+// (headers and SDP body).
+func (rc *RtspClient) describe(rtsp_url string) (string, error) {
 	// check and parse URL
 	if !rc.ParseUrl(rtsp_url) {
-		return errors.New("Invalid URL")
+		return "", errors.New("Invalid URL")
 	}
 
 	// establish connection to the camera
 	if !rc.Connect() {
-		return errors.New("Unable to connect")
+		return "", errors.New("Unable to connect")
 	}
 	// phase 1 OPTIONS - first stage of communication with the camera
 	// send OPTIONS request and read response to the OPTIONS request
@@ -67,13 +68,95 @@ func (rc *RtspClient) Client(rtsp_url string, _ bool) error {
 	}
 
 	// PHASE 2 DESCRIBE
-	if status, message, err := rc.SendRequest("DESCRIBE", rc.uri, nil); err != nil {
-		return errors.New("Unable to read DESCRIBE response; connection lost?")
-	} else if status != 200 {
-		return errors.New("DESCRIBE error; not status code 200 OK " + message)
-	} else {
-		rc.track = rc.ParseMedia(message)
+	status, message, err := rc.SendRequest("DESCRIBE", rc.uri, nil)
+	if err != nil {
+		return "", errors.New("Unable to read DESCRIBE response; connection lost?")
 	}
+	if status != 200 {
+		return "", errors.New("DESCRIBE error; not status code 200 OK")
+	}
+	return message, nil
+}
+
+// SourceInfo is what a camera announces in its DESCRIBE response.
+type SourceInfo struct {
+	Video []string // lower-case codec names in announced order, e.g. "h264"
+	Audio []string
+}
+
+// ProbeSource opens a short RTSP session (OPTIONS + DESCRIBE, no SETUP/PLAY), reads the announced
+// codecs and closes the connection.
+func ProbeSource(rtsp_url string) (*SourceInfo, error) {
+	rc := NewRtspClient()
+	defer rc.Close()
+
+	message, err := rc.describe(rtsp_url)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCodecs(message), nil
+}
+
+// ParseCodecs extracts the codec names announced per media section of an SDP. Static audio payload
+// types without rtpmap (0 = PCMU, 8 = PCMA) are recognized too.
+func ParseCodecs(sdp string) *SourceInfo {
+	info := &SourceInfo{}
+	media := ""
+	rtpmapSeen := false
+	var staticAudio []string
+	flush := func() {
+		if media == "audio" && !rtpmapSeen {
+			info.Audio = append(info.Audio, staticAudio...)
+		}
+		rtpmapSeen = false
+		staticAudio = nil
+	}
+
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "m="):
+			flush()
+			fields := strings.Fields(line[2:])
+			media = ""
+			if len(fields) > 0 && (fields[0] == "video" || fields[0] == "audio") {
+				media = fields[0]
+			}
+			if media == "audio" && len(fields) > 3 {
+				for _, pt := range fields[3:] {
+					switch pt {
+					case "0":
+						staticAudio = append(staticAudio, "pcmu")
+					case "8":
+						staticAudio = append(staticAudio, "pcma")
+					}
+				}
+			}
+		case strings.HasPrefix(line, "a=rtpmap:") && media != "":
+			// a=rtpmap:96 H264/90000
+			rest := line[len("a=rtpmap:"):]
+			if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+				name := strings.ToLower(strings.SplitN(strings.TrimSpace(rest[sp+1:]), "/", 2)[0])
+				if media == "video" {
+					info.Video = append(info.Video, name)
+				} else {
+					info.Audio = append(info.Audio, name)
+					rtpmapSeen = true
+				}
+			}
+		}
+	}
+	flush()
+	return info
+}
+
+// main function for working with RTSP
+func (rc *RtspClient) Client(rtsp_url string, _ bool) error {
+	message, err := rc.describe(rtsp_url)
+	if err != nil {
+		return err
+	}
+	rc.track = rc.ParseMedia(message)
 	if len(rc.track) == 0 {
 		return errors.New("Error; track not found")
 	}

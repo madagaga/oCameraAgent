@@ -10,10 +10,9 @@ import (
 )
 
 type Device struct {
-	URL   string `yaml:"url"`
-	Name  string `yaml:"name"`
-	Audio string `yaml:"audio"`
-	Video string `yaml:"video"`
+	URL           string `yaml:"url"`
+	Name          string `yaml:"name"`
+	ProbeInterval int    `yaml:"probe_interval"` // seconds between source probes (default 30)
 }
 
 type MQTT struct {
@@ -76,12 +75,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid configuration: device.url must start with rtsp://")
 	}
 
-	if strings.TrimSpace(c.Device.Video) == "" {
-		return fmt.Errorf("invalid configuration: device.video is required (e.g. H264)")
-	}
-	if strings.TrimSpace(c.Device.Audio) == "" {
-		return fmt.Errorf("invalid configuration: device.audio is required (e.g. PCMU)")
-	}
 	if len(c.Device.Name) > 64 {
 		return fmt.Errorf("invalid configuration: device.name is limited to 64 characters")
 	}

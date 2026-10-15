@@ -53,12 +53,16 @@ type WebRTCProxy struct {
 }
 
 // NewWebRTCProxy creates the proxy of one session. stun: the agent's STUN servers (config ice.stun).
-func NewWebRTCProxy(device Device, stun []string) *WebRTCProxy {
-	Info("WEBRTC", "Session proxy created for %s", redactURL(device.URL))
+func NewWebRTCProxy(url, video, audio string, stun []string) *WebRTCProxy {
+	Info("WEBRTC", "Session proxy created for %s (video=%s audio=%s)", redactURL(url), video, audio)
+	audioCodec := ""
+	if audio != "" {
+		audioCodec = "audio/" + audio
+	}
 	return &WebRTCProxy{
-		rtspUrl:    device.URL,
-		audioCodec: "audio/" + device.Audio,
-		videoCodec: "video/" + device.Video,
+		rtspUrl:    url,
+		audioCodec: audioCodec,
+		videoCodec: "video/" + video,
 		stun:       stun,
 		done:       make(chan struct{}),
 	}
@@ -105,7 +109,7 @@ func (wp *WebRTCProxy) HandleOffer(offer webrtc.SessionDescription, wantAudio bo
 	if !strings.Contains(lowerSDP, " "+videoName+"/") {
 		return nil, newSessionError(ErrUnsupportedCodec, "the offer does not contain video codec "+videoName)
 	}
-	addAudio := wantAudio && strings.Contains(lowerSDP, "m=audio")
+	addAudio := wantAudio && wp.audioCodec != "" && strings.Contains(lowerSDP, "m=audio")
 
 	answer, err := wp.createAnswer(offer, addAudio)
 	if err != nil {

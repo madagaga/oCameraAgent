@@ -42,7 +42,7 @@ func TestRedactURL(t *testing.T) {
 func TestConfigValidate(t *testing.T) {
 	ok := Config{
 		MQTT:   MQTT{URL: "ssl://b:8883", Username: "cam-1", Password: "x"},
-		Device: Device{URL: "rtsp://h/s", Video: "H264", Audio: "PCMU"},
+		Device: Device{URL: "rtsp://h/s"},
 	}
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
@@ -101,5 +101,61 @@ func TestHandleTCPPacketsResync(t *testing.T) {
 	}
 	if len(rc.payload) < 20 {
 		t.Error("the grown buffer must be kept")
+	}
+}
+
+func TestParseCodecs(t *testing.T) {
+	sdp := "RTSP/1.0 200 OK\r\nCSeq: 2\r\n\r\nv=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n" +
+		"m=audio 0 RTP/AVP 0\r\na=control:track2\r\nm=audio 0 RTP/AVP 97\r\na=rtpmap:97 MPEG4-GENERIC/16000\r\n"
+	info := ParseCodecs(sdp)
+	if !equalStrings(info.Video, []string{"h264"}) {
+		t.Errorf("video: %v", info.Video)
+	}
+	// first audio section has no rtpmap: static payload type 0 = PCMU
+	if !equalStrings(info.Audio, []string{"pcmu", "mpeg4-generic"}) {
+		t.Errorf("audio: %v", info.Audio)
+	}
+	if got := firstSupported(info.Audio, supportedAudio); got != "pcmu" {
+		t.Errorf("supported audio: %q", got)
+	}
+	if got := filterSupported([]string{"mpeg4-generic"}, supportedAudio); got == nil || len(got) != 0 {
+		t.Errorf("filterSupported must return an empty non-nil list, got %v", got)
+	}
+}
+
+func TestSourceMonitorTransitions(t *testing.T) {
+	m := NewSourceMonitor("rtsp://h/s", time.Minute)
+	changes := 0
+	m.onChange = func() { changes++ }
+	fail := true
+	m.probe = func(string) (*SourceInfo, error) {
+		if fail {
+			return nil, net.ErrClosed
+		}
+		return &SourceInfo{Video: []string{"h264"}}, nil
+	}
+
+	// nothing known yet: a failure is immediately offline (no change event, it was never online)
+	if m.ProbeNow() {
+		t.Fatal("must be offline")
+	}
+	fail = false
+	if !m.ProbeNow() || changes != 1 {
+		t.Fatalf("must come back online with one change, changes=%d", changes)
+	}
+	// offline only after probeFailThreshold consecutive failures
+	fail = true
+	for i := 1; i < probeFailThreshold; i++ {
+		if !m.ProbeNow() {
+			t.Fatalf("went offline after only %d failures", i)
+		}
+	}
+	if m.ProbeNow() || changes != 2 {
+		t.Fatalf("must be offline after %d failures, changes=%d", probeFailThreshold, changes)
+	}
+	// a single success restores it
+	fail = false
+	if !m.ProbeNow() || changes != 3 {
+		t.Fatalf("must be back online, changes=%d", changes)
 	}
 }

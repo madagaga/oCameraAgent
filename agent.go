@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"strings"
 	"sync"
 	"time"
 
@@ -38,8 +37,9 @@ type Session struct {
 
 // Agent implements the session rules of § 7: `idle` or `busy(sid, viewer)`.
 type Agent struct {
-	cfg  *Config
-	mqtt *MqttClient
+	cfg    *Config
+	mqtt   *MqttClient
+	source *SourceMonitor
 
 	mu   sync.Mutex
 	sess *Session // nil = idle
@@ -47,6 +47,7 @@ type Agent struct {
 
 func NewAgent(cfg *Config) (*Agent, error) {
 	a := &Agent{cfg: cfg}
+	a.source = NewSourceMonitor(cfg.Device.URL, time.Duration(cfg.Device.ProbeInterval)*time.Second)
 	m, err := NewMqttClient(cfg.MQTT, a.state)
 	if err != nil {
 		return nil, err
@@ -56,23 +57,48 @@ func NewAgent(cfg *Config) (*Agent, error) {
 	return a, nil
 }
 
-func (a *Agent) Run() error { return a.mqtt.Connect() }
+// Run probes the source once (so the first published state is accurate), connects to the broker and
+// starts the periodic source monitoring.
+func (a *Agent) Run() error {
+	a.source.ProbeNow()
+	a.source.onChange = func() { a.mqtt.PublishState(true) }
+	if err := a.mqtt.Connect(); err != nil {
+		return err
+	}
+	// the stream itself is the signal during a session: no probing then
+	go a.source.Run(func() bool { return a.current() != nil })
+	return nil
+}
+
+// codecs returns the codecs to use, detected from the camera announcement (video is empty when
+// nothing usable is known, audio is empty when the camera has no audio WebRTC can carry).
+func (a *Agent) codecs() (video, audio string) {
+	info := a.source.Info()
+	if info == nil {
+		return "", ""
+	}
+	return firstSupported(info.Video, supportedVideo), firstSupported(info.Audio, supportedAudio)
+}
 
 // state builds the published state (§ 5).
 func (a *Agent) state(online bool) State {
 	st := State{
-		V:      ProtocolVersion,
-		TS:     time.Now().Unix(),
-		Name:   a.cfg.Device.Name,
-		Online: online,
+		V:    ProtocolVersion,
+		TS:   time.Now().Unix(),
+		Name: a.cfg.Device.Name,
+		// the agent and its camera are one entity for viewers: unreachable source = offline
+		Online: online && a.source.Online(),
 		Kind:   "relay",
-		Caps: &StateCaps{
-			Video:   []string{strings.ToLower(a.cfg.Device.Video)},
-			Audio:   []string{strings.ToLower(a.cfg.Device.Audio)},
+		Agent:  &StateInfo{Name: AgentName, Version: AgentVersion},
+	}
+	// caps are only published once the camera announced something (viewers keep the last known ones)
+	if info := a.source.Info(); info != nil {
+		st.Caps = &StateCaps{
+			Video:   filterSupported(info.Video, supportedVideo),
+			Audio:   filterSupported(info.Audio, supportedAudio),
 			Streams: []string{"main"},
 			Cmds:    []string{},
-		},
-		Agent: &StateInfo{Name: AgentName, Version: AgentVersion},
+		}
 	}
 	if online {
 		a.mu.Lock()
@@ -150,8 +176,19 @@ func (a *Agent) handleOffer(from string, env Envelope) {
 		}
 	}
 
+	// A camera believed offline may just be back: probe before refusing.
+	if !a.source.Online() && !a.source.ProbeNow() {
+		a.sendError(from, env.SID, ErrSourceUnavailable, "camera unreachable", true)
+		return
+	}
+	video, audio := a.codecs()
+	if video == "" {
+		a.sendError(from, env.SID, ErrUnsupportedCodec, "the camera announces no video codec WebRTC can carry", false)
+		return
+	}
+
 	s := &Session{sid: env.SID, viewer: from, started: time.Now()}
-	proxy := NewWebRTCProxy(a.cfg.Device, a.cfg.ICE.Stun)
+	proxy := NewWebRTCProxy(a.cfg.Device.URL, video, audio, a.cfg.ICE.Stun)
 	s.proxy = proxy
 	proxy.onLocalICE = func(c *webrtc.ICECandidate) { s.queueICE(a, c) }
 	proxy.onConnected = func() { a.onConnected(s) }
@@ -271,6 +308,10 @@ func (a *Agent) endSession(s *Session, reason string, sendBye bool) {
 	s.stopICE()
 	s.proxy.Close()
 
+	if reason == ByeSourceLost {
+		a.source.MarkDown()
+	}
+
 	if sendBye {
 		a.mqtt.Send(s.viewer, TypeBye, s.sid, ByeData{Reason: reason})
 	}
@@ -281,6 +322,7 @@ func (a *Agent) endSession(s *Session, reason string, sendBye bool) {
 
 // Shutdown closes the current session, if any (bye `shutdown`), then publishes the offline state.
 func (a *Agent) Shutdown() {
+	a.source.Stop()
 	if s := a.current(); s != nil {
 		a.mu.Lock()
 		a.sess = nil
